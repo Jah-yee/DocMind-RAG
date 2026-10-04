@@ -2,8 +2,18 @@ name: CI Nightly
 
 on:
   schedule:
-    - cron: '0 2 * * *'  # 02:00 UTC daily
-  workflow_dispatch:       # manual trigger
+    # 每周一次（周一 02:00 UTC）而不是每天：integration 已由 ci-fast 在每次
+    # develop 合并时执行，这里保留的目的是**环境漂移检查** —— 即使代码没变，
+    # 上游依赖 / runner 镜像 / PyPI 包也可能变化。
+    - cron: '0 2 * * 1'
+  # 手动触发可指定分支；不填时与 schedule 一样默认测 develop。
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: '要测试的分支（默认 develop）'
+        required: false
+        default: 'develop'
+        type: string
 
 concurrency:
   group: ci-nightly-${{ github.ref }}
@@ -70,26 +80,28 @@ jobs:
 
     steps:
       - uses: actions/checkout@v7
+        with:
+          # schedule 事件只在默认分支（main）上触发，而 main 在 Git Flow 下只在
+          # 发版时更新 —— 直接跑 main 等于天天测一个陈旧快照（曾落后 develop 95 个提交，
+          # 且缺 sqlalchemy[asyncio]，导致 155 个 integration 测试全部 skip）。
+          # 这里显式签出集成分支，让 nightly 真正验证"即将发布的代码"。
+          ref: ${{ inputs.ref || 'develop' }}
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Cache pip
-        uses: actions/cache@v6
+      # 与 ci-fast 用同一套安装方式（uv），避免两个 workflow 混用 pip / uv。
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
         with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ matrix.python-version }}-${{ hashFiles('backend/requirements.txt', 'backend/requirements-dev.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-${{ matrix.python-version }}-
+          enable-cache: true
+          cache-dependency-glob: 'backend/requirements*.txt'
 
       - name: Install dependencies
         working-directory: backend
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install -r requirements-dev.txt
+        run: uv pip install --system -r requirements.txt -r requirements-dev.txt
 
       - name: Migration smoke test on real MySQL
         working-directory: backend
@@ -109,33 +121,7 @@ jobs:
           flags: backend,integration
           fail_ci_if_error: false
 
-  docker-build:
-    name: Docker Build
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-
-      - name: Build backend image
-        uses: docker/build-push-action@v7
-        with:
-          context: backend
-          push: false
-          tags: docmind-backend:${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-      - name: Build frontend image
-        uses: docker/build-push-action@v7
-        with:
-          context: frontend
-          push: false
-          tags: docmind-frontend:${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+  # Docker Build 已拆分到独立的 docker-build.yml（按路径触发，避免每天无条件重跑）。
 
   # 名字里显式写出 "audits advisory"：bandit 是阻断门禁，依赖审计不是。
   # 否则 Actions 页面上的绿色对勾会被误读成"没有已知漏洞"。
