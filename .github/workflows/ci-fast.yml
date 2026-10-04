@@ -350,6 +350,16 @@ jobs:
         working-directory: frontend
         run: npm run build
 
+      # E2E 冒烟：纯前端 + page.route 打桩，不需要后端/数据库服务。
+      # 只跑 chromium，用例 4 条，实测墙钟开销见 PR 描述。
+      - name: Install Playwright browser
+        working-directory: frontend
+        run: npx playwright install --with-deps chromium
+
+      - name: E2E smoke tests
+        working-directory: frontend
+        run: npx playwright test
+
   # 校验 workflow 文件本身：表达式、needs 引用、shellcheck run 块
   workflow-lint:
     name: Workflow Lint
