@@ -20,6 +20,7 @@ from app.core.security import (
     get_current_user,
     get_document_for_user,
     permission_required,
+    require_organization,
 )
 from app.exceptions import AppError, AuthorizationError, NotFoundError
 from app.models.document import Document, DocumentStatus, DocumentType
@@ -121,24 +122,9 @@ async def upload_document(
         current_user = await db.merge(current_user)
 
         # 2. 确定组织 ID
-        org_id = current_user.organization_id
-        if not org_id:
-            from app.models.organization import Organization
-            result = await db.execute(
-                select(Organization).order_by(Organization.id).limit(1)
-            )
-            default_org = result.scalar_one_or_none()
-            if default_org:
-                org_id = default_org.id
-            else:
-                org = Organization(
-                    name="Default", description="默认组织", color="#64748b",
-                    is_private=False, parent_id=None, level=0, sort_order=0,
-                    owner_id=current_user.id,
-                )
-                db.add(org)
-                await db.flush()
-                org_id = org.id
+        # S3 安全加固：fail closed —— 无组织用户不得上传文档，
+        # 不再兜底到最低 ID 的组织或自动创建 Default 组织
+        org_id = require_organization(current_user)
 
         # 3. 解析标签为列表
         keywords_list = []

@@ -72,6 +72,43 @@ def smart_truncate(text: str, max_length: int) -> str:
     return truncated.strip()
 
 
+def _find_split_point(text: str, max_length: int) -> int:
+    """在 max_length 内寻找最近的分割位置（段落 > 句子 > 空格 > 硬切）。
+
+    返回切分位置索引（>0 且 <= max_length）；调用方负责保证剩余文本逐段收缩。
+    """
+    window = text[:max_length]
+    for sep in PARAGRAPH_SEPARATORS:
+        pos = window.rfind(sep)
+        if pos > max_length * 0.4:
+            return pos + len(sep)
+    for sep in SENTENCE_SEPARATORS:
+        pos = window.rfind(sep)
+        if pos > max_length * 0.5:
+            return pos + len(sep)
+    pos = window.rfind(' ')
+    if pos > max_length * 0.7:
+        return pos + 1
+    return max_length
+
+
+def _split_overlong_text(text: str, max_length: int) -> list[str]:
+    """把超长文本切成多个连续片段（每段 <= max_length，内容零丢失）。
+
+    修复（R3）：此前超长块走 smart_truncate 直接截断，当语义切分未产生
+    断点时（重复文本/表格/列表等），整个分区会被截掉一大半且无任何报错。
+    """
+    pieces: list[str] = []
+    remaining = text
+    while len(remaining) > max_length:
+        cut = _find_split_point(remaining, max_length)
+        pieces.append(remaining[:cut])
+        remaining = remaining[cut:]
+    if remaining:
+        pieces.append(remaining)
+    return pieces
+
+
 def find_clause_boundaries(text: str) -> list[int]:
     """扫描全文，返回所有条款起始位置的字符偏移列表（含 0）。"""
     boundaries = [0]
@@ -255,12 +292,17 @@ class SemanticChunker:
         if current_text:
             merged_chunks.append({"text": current_text, "metadata": {}})
 
-        # 8. 智能截断超长块
+        # 8. 超长块连续切分（修复 R3：不再截断；保证内容不丢失）
+        split_chunks: list[dict] = []
         for ch in merged_chunks:
-            if len(ch["text"]) > self.chunk_max_chars:
-                ch["text"] = smart_truncate(ch["text"], self.chunk_max_chars)
+            if len(ch["text"]) <= self.chunk_max_chars:
+                split_chunks.append(ch)
+                continue
+            metadata = ch.get("metadata", {})
+            for piece in _split_overlong_text(ch["text"], self.chunk_max_chars):
+                split_chunks.append({"text": piece, "metadata": dict(metadata)})
 
-        return merged_chunks
+        return split_chunks
 
     def _merge_small_tails(self, chunks: list[dict]) -> list[dict]:
         """把过小的尾块（< 200 字符）合并到前一块。"""

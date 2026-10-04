@@ -21,7 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.v1.endpoints.notifications import create_notification
 from app.core.config import settings
 from app.core.database import get_db
-from app.core.security import get_current_user, permission_required
+from app.core.security import get_current_user, permission_required, require_organization
 from app.exceptions import (
     AppError,
     AuthorizationError,
@@ -131,7 +131,8 @@ async def create_user_admin(
 
         org_id = body.organization_ids[0] if body.organization_ids else None
         if org_id is not None and not current_user.is_superuser:
-            if org_id != (current_user.organization_id or 1):
+            # S3 安全加固：无组织用户不再兜底到 1 号组织，直接 403
+            if org_id != require_organization(current_user):
                 raise AuthorizationError("无权在指定组织创建用户")
 
         user = await auth_service.create_user(
@@ -175,10 +176,10 @@ async def update_user_admin(
         ).scalar_one_or_none()
         if not user:
             raise NotFoundError("用户不存在")
-        if (
-            not current_user.is_superuser
-            and current_user.organization_id
-            and user.organization_id != current_user.organization_id
+        # 安全加固：非超管仅能修改同组织成员；无组织用户一律拒绝（fail closed）
+        if not current_user.is_superuser and (
+            current_user.organization_id is None
+            or user.organization_id != current_user.organization_id
         ):
             raise AuthorizationError("无权修改该用户")
 
@@ -199,7 +200,8 @@ async def update_user_admin(
             user.is_active = body.status != "inactive"
         if body.organization_ids:
             org_id = body.organization_ids[0]
-            if not current_user.is_superuser and org_id != (current_user.organization_id or 1):
+            # S3 安全加固：无组织用户不再兜底到 1 号组织，直接 403
+            if not current_user.is_superuser and org_id != require_organization(current_user):
                 raise AuthorizationError("无权将用户移动到该组织")
             user.organization_id = org_id
         if body.remark is not None:
@@ -241,10 +243,10 @@ async def reset_user_password_admin(
         ).scalar_one_or_none()
         if not user:
             raise NotFoundError("用户不存在")
-        if (
-            not current_user.is_superuser
-            and current_user.organization_id
-            and user.organization_id != current_user.organization_id
+        # 安全加固：非超管仅能重置同组织成员密码；无组织用户一律拒绝（fail closed）
+        if not current_user.is_superuser and (
+            current_user.organization_id is None
+            or user.organization_id != current_user.organization_id
         ):
             raise AuthorizationError("无权重置该用户密码")
 
@@ -285,9 +287,11 @@ async def get_audit_logs(
     try:
         stmt = select(UserActivityLog)
 
-        # 组织隔离：只查看同组织的日志
-        if current_user.organization_id and not current_user.is_superuser:
-            stmt = stmt.join(User).where(User.organization_id == current_user.organization_id)
+        # 组织隔离：非超管只能查看同组织的日志；
+        # 安全加固（S2）：无组织用户用不存在的组织 ID（-1）兜底，
+        # 防止其看到一个包含所有组织日志的列表（与导出接口保持一致）
+        if not current_user.is_superuser:
+            stmt = stmt.join(User).where(User.organization_id == (current_user.organization_id or -1))
 
         if user_id:
             stmt = stmt.where(UserActivityLog.user_id == user_id)
@@ -795,9 +799,13 @@ async def get_user(
     if not user:
         raise NotFoundError("用户不存在")
 
-    # 组织隔离：不允许查看其他组织的用户（除非是超级管理员）
-    if not current_user.is_superuser and current_user.organization_id:
-        if user.organization_id != current_user.organization_id:
+    # 组织隔离：不允许查看其他组织的用户（超级管理员除外）；
+    # 安全加固：无组织用户一律拒绝（fail closed），不再绕过隔离
+    if not current_user.is_superuser:
+        if (
+            current_user.organization_id is None
+            or user.organization_id != current_user.organization_id
+        ):
             raise AuthorizationError("无权查看该用户信息")
 
     # 安全解析 bio
@@ -887,6 +895,13 @@ async def delete_user(
 
         if not user:
             raise NotFoundError("用户不存在")
+        # 安全加固（S2）：与 update_user_role 一致 —— 非超管（或无组织用户）
+        # 不得删除别的组织（或其他租户）的用户
+        if not current_user.is_superuser and (
+            current_user.organization_id is None
+            or user.organization_id != current_user.organization_id
+        ):
+            raise AuthorizationError("无权删除该用户")
         if user.id == current_user.id:
             raise ValidationError("不能删除自己的账户")
         if user.is_superuser:

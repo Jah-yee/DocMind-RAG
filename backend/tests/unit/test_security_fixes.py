@@ -59,10 +59,19 @@ class TestSqlOrgFilter:
         # OR must stay inside the org-filtered parentheses
         assert q.count("(") == q.count(")")
 
-    def test_explicit_org_filter_not_duplicated(self):
+    def test_explicit_org_filter_for_other_org_still_gets_scoped(self):
+        # 安全修复（S4b）：旧行为是「查询里出现 organization_id 就跳过注入」，
+        # 于是自带 `organization_id = 3` 的查询能完全躲开租户过滤；
+        # 现在只有等值限定为"调用者自己的组织"时才跳过，
+        # 其他组织的自供条件不能禁用注入（结果由 AND 收紧为空）。
         q = _inject_org_filter("SELECT id FROM documents WHERE organization_id = 3", 7)
-        assert "organization_id = 7" not in q
+        assert "organization_id = 7" in q
         assert "organization_id = 3" in q
+
+    def test_explicit_own_org_filter_not_duplicated(self):
+        # 调用者自带的条件就是自己的组织时，不应该重复注入
+        q = _inject_org_filter("SELECT id FROM documents WHERE organization_id = 7", 7)
+        assert q.count("organization_id = 7") == 1
 
     def test_order_by_kept_after_where(self):
         q = _inject_org_filter("SELECT id FROM documents ORDER BY id", 7)

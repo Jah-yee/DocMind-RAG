@@ -22,6 +22,22 @@ def _get_redis():
     return redis_client
 
 
+# 修复（R5）：内存回退缓存必须是进程级共享注册表。
+# 此前每次 clear_for_org 调用都 `RetrievalCache()` 新建实例，清空的是刚创建的空
+# _memory，而真正服务读写的实例是 pipeline 单例持有的那个（dependencies.py），
+# 导致 Redis 不可用时文档更新后旧内容仍命中缓存。
+_SHARED_MEMORY: "BoundedLRUCache | None" = None
+
+
+def _get_shared_memory() -> "BoundedLRUCache":
+    """获取进程级共享的内存回退缓存（容量取 RAG_CACHE_MAX_SIZE）。"""
+    global _SHARED_MEMORY
+    if _SHARED_MEMORY is None:
+        max_size = max(100, int(getattr(settings, "RAG_CACHE_MAX_SIZE", 1000) or 1000))
+        _SHARED_MEMORY = BoundedLRUCache(max_size=max_size)
+    return _SHARED_MEMORY
+
+
 class BoundedLRUCache:
     """Size-bounded LRU cache using OrderedDict."""
 
@@ -64,8 +80,9 @@ class RetrievalCache:
     """Exact-match retrieval cache backed by Redis (with bounded LRU memory fallback)."""
 
     def __init__(self):
-        max_size = max(100, int(getattr(settings, "RAG_CACHE_MAX_SIZE", 1000) or 1000))
-        self._memory = BoundedLRUCache(max_size=max_size)
+        # 修复（R5）：所有实例共享同一内存回退缓存，保证任意实例上的
+        # clear_for_org 都能清理到实际服务读写的 pipeline 单例缓存数据。
+        self._memory = _get_shared_memory()
 
     def _key(self, query: str, organization_id: int, top_k: int) -> str:
         return f"org={organization_id}|topk={top_k}|q={query.strip().lower()}"
@@ -130,14 +147,28 @@ class SemanticCache:
     Stores query embeddings in a sorted set keyed by a quantized hash.
     At lookup time, finds candidates within a Hamming distance window
     and checks cosine similarity only on those candidates.
+
+    修复（R4）：问答缓存（chat_service 缓存完整 answer）与检索缓存
+    （RAGPipeline 只缓存 sources、answer 为空）使用两个独立命名空间，
+    否则检索阶段写入的空 answer 条目会被问答链路按相似度命中，
+    在用户中断流式回答后返回空消息。
     """
 
-    def __init__(self):
+    # 检索专用命名空间（RAGPipeline 使用，见 for_retrieval）
+    RETRIEVAL_PREFIX = "rag:sem:retrieval:"
+    RETRIEVAL_INDEX_KEY = "rag:semantic_index:retrieval"
+
+    def __init__(self, prefix: str = "rag:sem:", index_key: str = "rag:semantic_index"):
         self.threshold = getattr(settings, "SEMANTIC_CACHE_THRESHOLD", 0.92)
         self.ttl = getattr(settings, "SEMANTIC_CACHE_TTL_SECONDS", 3600)
-        self.index_key = "rag:semantic_index"
-        self.prefix = "rag:sem:"
+        self.index_key = index_key
+        self.prefix = prefix
         self._quantize_bits = 64
+
+    @classmethod
+    def for_retrieval(cls) -> "SemanticCache":
+        """构建检索专用实例（独立 key 空间，不与问答缓存互相命中）。"""
+        return cls(prefix=cls.RETRIEVAL_PREFIX, index_key=cls.RETRIEVAL_INDEX_KEY)
 
     def _quantize(self, embedding: list[float]) -> int:
         """Quantize embedding to a compact integer for sorted set scoring."""
@@ -240,15 +271,23 @@ class SemanticCache:
             logger.error(f"Semantic cache store failed: {e}")
 
     async def clear_for_org(self, organization_id: int) -> None:
-        """Invalidate all semantic cache entries for an organization."""
+        """Invalidate all semantic cache entries for an organization.
+
+        修复（R4）：问答与检索两个命名空间都要清理（调用点仍以
+        `SemanticCache()` 默认实例调用），否则文档更新后检索缓存仍会命中旧内容。
+        """
         try:
             rc = _get_redis()
             if rc is None:
                 return
-            index_key = f"{self.index_key}:{organization_id}"
-            cache_prefix = f"{self.prefix}org:{organization_id}:"
-            async for key in rc.scan_iter(match=f"{cache_prefix}*", count=100):
-                await rc.delete(key)
-            await rc.delete(index_key)
+            namespaces = {
+                self.prefix: self.index_key,
+                self.RETRIEVAL_PREFIX: self.RETRIEVAL_INDEX_KEY,
+            }
+            for prefix, index_key in namespaces.items():
+                cache_prefix = f"{prefix}org:{organization_id}:"
+                async for key in rc.scan_iter(match=f"{cache_prefix}*", count=100):
+                    await rc.delete(key)
+                await rc.delete(f"{index_key}:{organization_id}")
         except Exception as e:
             logger.error(f"Semantic cache clear failed: {e}")

@@ -209,7 +209,7 @@ class Planner:
                                  retry_strategy=step.retry_strategy,
                                  fallback_tool=step.fallback_tool)
                 await asyncio.sleep(0.005)
-            yield AgentEvent(type="plan_complete", plan_id=plan_id,
+            yield AgentEvent(type="plan_complete", plan_id=plan_id, plan_goal=structured_plan.goal,
                              content=f"计划已生成: {structured_plan.total_steps} 个步骤", plan_progress=0.0)
             if ctx:
                 ctx.record_decision("plan", "structured", f"Generated {len(structured_plan.steps)} steps")
@@ -355,6 +355,7 @@ class Planner:
             yield AgentEvent(
                 type="plan_complete",
                 plan_id=plan_id,
+                plan_goal=plan.goal,
                 content=f"计划已生成: {plan.total_steps} 个步骤",
                 plan_progress=0.0,
             )
@@ -384,6 +385,7 @@ class Planner:
             yield AgentEvent(
                 type="plan_complete",
                 plan_id=plan_id,
+                plan_goal=plan.goal,
                 content="使用默认计划（单步执行）",
                 plan_progress=0.0,
             )

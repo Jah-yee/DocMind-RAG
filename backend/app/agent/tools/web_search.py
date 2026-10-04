@@ -3,6 +3,7 @@
 Rate limited to 10 requests/minute per user via Redis counter.
 """
 
+import asyncio
 import ipaddress
 import logging
 from typing import Any
@@ -109,14 +110,21 @@ async def web_search(
 
     try:
         from duckduckgo_search import DDGS
-        results = []
-        with DDGS() as ddgs:
-            for r in ddgs.text(query, max_results=max_results):
-                results.append({
-                    "title": r.get("title", ""),
-                    "url": r.get("href", ""),
-                    "snippet": r.get("body", ""),
-                })
+
+        def _run_search() -> list[dict[str, str]]:
+            # DDGS is a blocking HTTP client; running it on the event loop would
+            # stall every other request served by this worker.
+            found: list[dict[str, str]] = []
+            with DDGS() as ddgs:
+                for r in ddgs.text(query, max_results=max_results):
+                    found.append({
+                        "title": r.get("title", ""),
+                        "url": r.get("href", ""),
+                        "snippet": r.get("body", ""),
+                    })
+            return found
+
+        results = await asyncio.to_thread(_run_search)
         if not results:
             return f"No web results found for: {query}"
 
@@ -194,8 +202,8 @@ async def fetch_webpage(
                 return f"Failed to fetch {url}: response too large (>2MB)"
             html = raw.decode("utf-8", errors="replace")
 
-            # Try readability extraction
-            text = _extract_text(html)
+            # Try readability extraction (CPU-bound parsing — keep it off the loop)
+            text = await asyncio.to_thread(_extract_text, html)
             if not text:
                 return f"Could not extract text content from {url}"
 

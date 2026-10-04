@@ -55,10 +55,23 @@ def test_policy_classification(error_type, expected_retryable, expected_action):
     assert policy.action == expected_action
 
 
-def test_all_23_policies_covered():
-    """Every error_type in ToolErrorType is represented."""
-    assert len(RETRY_POLICIES) == 23
-    # Verify no policy is missing action / max_retries
+def test_registry_error_codes_have_policies():
+    """Every error code the tool registry can emit must resolve to a real policy.
+
+    ToolResult.fail() accepts arbitrary codes, so the policy table is an open set:
+    an unmapped code silently falls back to unknown/fatal and skips retry. This
+    test fails if a code emitted by the registry loses its policy.
+    """
+    registry_codes = {
+        "not_found",         # unknown tool
+        "hook_error",        # pre-hook raised
+        "rate_limited",      # tool rate limit tripped
+        "validation_error",  # output schema mismatch
+        "timeout",           # asyncio.TimeoutError in the handler
+        "unknown",           # unclassified handler exception
+    }
+    missing = registry_codes - set(RETRY_POLICIES)
+    assert not missing, f"registry error codes without a policy: {sorted(missing)}"
     for _k, p in RETRY_POLICIES.items():
         assert p.action in ("repeat", "adapt_request", "reset_transport", "refresh_auth", "fatal")
         assert isinstance(p.max_retries, int)

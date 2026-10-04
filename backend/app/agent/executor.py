@@ -295,43 +295,52 @@ class Executor:
 
         tasks = [asyncio.create_task(run_step(s)) for s in steps]
 
-        # Drain events as they arrive
+        # Drain events as they arrive. If this generator is abandoned (client
+        # disconnect / early return), the finally block cancels whatever is still
+        # running — otherwise the orphaned steps keep calling tools and writing
+        # into shared plan and memory state after the request is gone.
         pending = set(tasks)
-        while pending:
-            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-            for task in done:
-                step, step_result = task.result()
-                # Flush this step's events
-                for evt in event_queues[step.id]:
-                    yield evt
-                event_queues[step.id].clear()
+        try:
+            while pending:
+                done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                for task in done:
+                    step, step_result = task.result()
+                    # Flush this step's events
+                    for evt in event_queues[step.id]:
+                        yield evt
+                    event_queues[step.id].clear()
 
-                step.result = step_result[:2000] if step_result else None
-                if step.status != "failed":
-                    step.status = "completed"
-                    plan.completed_steps += 1
-                    self._consecutive_failures = 0
-                    self._update_info_gain(step_result or "")
-                    self.memory.store_step_result(step.id, {
-                        "description": step.description, "status": step.status, "result": step.result,
-                    })
-                else:
-                    plan.failed_steps += 1
-                    self._consecutive_failures += 1
+                    step.result = step_result[:2000] if step_result else None
+                    if step.status != "failed":
+                        step.status = "completed"
+                        plan.completed_steps += 1
+                        self._consecutive_failures = 0
+                        self._update_info_gain(step_result or "")
+                        self.memory.store_step_result(step.id, {
+                            "description": step.description, "status": step.status, "result": step.result,
+                        })
+                    else:
+                        plan.failed_steps += 1
+                        self._consecutive_failures += 1
 
-                await self.memory.record_experience(
-                    success=(step.status == "completed"),
-                    action=f"{step.tool_hint or 'llm'}: {step.description[:100]}",
-                    result=step_result[:200] if step_result else str(step.error_context or "")[:200],
-                )
+                    await self.memory.record_experience(
+                        success=(step.status == "completed"),
+                        action=f"{step.tool_hint or 'llm'}: {step.description[:100]}",
+                        result=step_result[:200] if step_result else str(step.error_context or "")[:200],
+                    )
 
-                yield AgentEvent(
-                    type="thinking",
-                    content=f"{'✅' if step.status == 'completed' else '❌'} 步骤完成: {step.description}",
-                    thinking_type="evaluation",
-                    plan_id=plan.id, plan_step_id=step.id,
-                    plan_progress=plan.progress, plan_step_status=step.status,
-                )
+                    yield AgentEvent(
+                        type="thinking",
+                        content=f"{'✅' if step.status == 'completed' else '❌'} 步骤完成: {step.description}",
+                        thinking_type="evaluation",
+                        plan_id=plan.id, plan_step_id=step.id,
+                        plan_progress=plan.progress, plan_step_status=step.status,
+                    )
+        finally:
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
 
     async def _execute_step_with_retry(
         self,
@@ -680,7 +689,7 @@ class Executor:
                         plan_id=plan.id,
                         plan_step_id=step.id,
                         retry_attempt=getattr(step, "retry_count", 0),
-                        reflect_result=error_type,
+                        error_type=error_type,
                     )
                     tool_results.append({"tool": func.name, "result": result, "error_type": error_type})
                 else:

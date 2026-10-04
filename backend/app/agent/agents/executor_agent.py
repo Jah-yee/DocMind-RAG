@@ -351,6 +351,38 @@ class ExecutorAgent:
             error=None if success else (tool_calls[-1].error_message if tool_calls else "unknown"),
         )
 
+    # Parameters a step's description can safely stand in for: a step such as
+    # "检索 2024 年营收" is itself the query text the tool wants. Anything else
+    # (ids, structured payloads, multi-arg tools) cannot be guessed.
+    _TEXTUAL_PARAMS = ("query", "text", "code", "url", "expression")
+
+    def _resolve_tool_arguments(self, step: PlanStep, entry) -> tuple[dict, str | None]:
+        """Best-effort conversion of a plan step into the tool's arguments.
+
+        Returns (arguments, error). An error means the step cannot be dispatched
+        honestly — better a diagnosable validation_error than a TypeError from
+        calling the handler with an empty dict.
+        """
+        params = (entry.parameters or {}).get("properties") or {}
+        required = list((entry.parameters or {}).get("required") or [])
+        if not required:
+            return {}, None
+
+        arguments: dict[str, Any] = {}
+        unresolved: list[str] = []
+        for name in required:
+            if name in self._TEXTUAL_PARAMS and name in params:
+                arguments[name] = step.description
+            else:
+                unresolved.append(name)
+
+        if unresolved:
+            return {}, (
+                f"步骤 {step.id} 无法为工具 '{step.tool_hint}' 解析参数 {unresolved}"
+                f"（步骤描述中缺少这些值）"
+            )
+        return arguments, None
+
     async def _call_tool(self, step: PlanStep, retry: bool = False) -> tuple[ToolResult, ToolCallRecord]:
         """Call the actual tool via ToolRegistry.
 
@@ -365,10 +397,26 @@ class ExecutorAgent:
             )
 
         from app.agent.registry import tool_registry as registry
+        entry = registry.get(step.tool_hint)
+        if not entry:
+            tr = ToolResult.fail(code="not_found", message=f"未知工具 '{step.tool_hint}'")
+            return tr, ToolCallRecord(
+                tool_name=step.tool_hint, args_summary="", success=False,
+                error_code="not_found", error_message=tr.error.message,
+            )
+
+        arguments, arg_error = self._resolve_tool_arguments(step, entry)
+        if arg_error:
+            tr = ToolResult.fail(code="validation_error", message=arg_error)
+            return tr, ToolCallRecord(
+                tool_name=step.tool_hint, args_summary="", success=False,
+                error_code="validation_error", error_message=arg_error,
+            )
+
         start = time.perf_counter()
         result = await registry.execute_detailed(
             step.tool_hint,
-            {},
+            arguments,
             organization_id=self._organization_id,
             user_id=self._user_id,
         )
@@ -376,7 +424,7 @@ class ExecutorAgent:
 
         record = ToolCallRecord(
             tool_name=step.tool_hint,
-            args_summary=str({k: str(v)[:50] for k, v in {}.items()})[:200],
+            args_summary=str({k: str(v)[:50] for k, v in arguments.items()})[:200],
             success=result.success,
             error_code=result.error.code if result.error else None,
             error_message=result.error.message if result.error else None,

@@ -18,8 +18,10 @@ from app.services.memory_service import get_memory_system
 
 router = APIRouter()
 
-# agent_id 会拼入全局 memory dict 的 key，必须严格限制字符与长度，防止内存 DoS
-_AGENT_ID_PATTERN = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
+# agent_id 会拼入全局 memory dict 的 key，必须严格限制字符与长度，防止内存 DoS。
+# 允许冒号：会话作用域的 agent_id 形如 "session:<uuid>"，
+# 操作员需要用它来清理单个会话（而非该用户全部会话）的记忆。
+_AGENT_ID_PATTERN = re.compile(r"^[a-zA-Z0-9_:-]{1,64}$")
 
 
 def _normalize_agent_id(agent_id: str) -> str:
@@ -28,7 +30,7 @@ def _normalize_agent_id(agent_id: str) -> str:
     if not agent_id:
         return "default"
     if not _AGENT_ID_PATTERN.match(agent_id):
-        raise ValidationError("agent_id 仅允许字母、数字、下划线、连字符，长度 1-64")
+        raise ValidationError("agent_id 仅允许字母、数字、下划线、连字符、冒号，长度 1-64")
     return agent_id
 
 
