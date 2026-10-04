@@ -1,0 +1,72 @@
+name: CI Hygiene
+
+on:
+  pull_request:
+    branches: [main, develop]
+
+concurrency:
+  group: ci-hygiene-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  commitlint:
+    name: Commit Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      # 只校验本次 PR 新增的提交，不追溯历史提交（历史里本来就不全是
+      # conventional commit，全量校验会立刻红且无法修复）。
+      - name: Lint PR commits
+        uses: wagoid/commitlint-github-action@v6
+        with:
+          configFile: .commitlintrc.json
+
+  pr-label:
+    name: PR Labels
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/labeler@v5
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+  # 任务书原文在此处被截断（以 "..." 占位），第三个 job 由执行方按
+  # "零配置、不依赖外部 action、只检查本 PR 新增行" 的原则补全：
+  # 防止未解决的合并冲突标记被误提交。
+  #
+  # 实现说明（v1 有 fail-open 缺陷，经对抗评审修正）：
+  # - PR checkout 默认浅克隆且签出的是 merge 提交（refs/pull/<n>/merge），
+  #   三点 diff（A...B）在此条件下求不出 merge-base 会直接 fatal；
+  # - 且绝不能写 `if git diff ... | grep`：git 失败会被 grep 的退出码
+  #   掩盖成"绿"（假阴性）。因此 diff 单独成命令、重定向到文件
+  #   （失败时 bash -e 立即让 step 红），再对落盘 diff 做 grep；
+  # - 两点 diff（基线 tip → merge 提交）不需要 merge-base，浅克隆可用，
+  #   且对 PR 场景即本 PR 的完整改动。
+  conflict-markers:
+    name: Conflict Markers
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - name: Detect merge conflict markers in PR diff
+        run: |
+          BASE="refs/remotes/origin/${{ github.base_ref }}"
+          git fetch --no-tags --depth=1 origin "+refs/heads/${{ github.base_ref }}:$BASE"
+          git diff "$BASE" HEAD --unified=0 > /tmp/pr.diff
+          # 只匹配 <<<<<<< / >>>>>>>（======= 是合法的 Markdown setext 标题标记，
+          # 不能匹配，否则文档改动会误报）。
+          if grep -E '^\+(<<<<<<<|>>>>>>>)' /tmp/pr.diff; then
+            echo "::error::发现未解决的合并冲突标记"
+            exit 1
+          fi
+          echo "未发现冲突标记"

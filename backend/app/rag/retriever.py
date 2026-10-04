@@ -365,7 +365,11 @@ class HybridRetriever:
             # 保证重排序器（及下游 workflow 检索节点）拿到非空文档文本。
             chunk_id = str(hit.get("_id") or "")
             if not chunk_id:
-                text_hash = hashlib.sha1(text.encode("utf-8")).hexdigest()[:16]
+                # 仅用于去重的稳定标识，不是密码学用途 —— 显式标注以免被静态扫描
+                # 当作弱哈希（与本仓库其它 hashlib 调用一致）。
+                text_hash = hashlib.sha1(
+                    text.encode("utf-8"), usedforsecurity=False
+                ).hexdigest()[:16]
                 chunk_id = f"{doc_id or 'unknown'}:{text_hash}"
 
             documents.append({

@@ -81,3 +81,9 @@ markers = [
     "integration: Integration tests (need DB/ES/Redis)",
     "slow: Slow tests (deselect with -m 'not slow')",
 ]
+
+[tool.coverage.report]
+# 实测基线（unit + behavior + 两个集成文件）：约 44%（本机复跑 44.10%，
+# Total 16737 行中约 9356 行未覆盖；对抗评审在另一环境下读到 44.30%／9323 行，
+# 属环境相关波动）。设 42 作为棘轮下限：留 2 个点余量，只挡继续下滑。
+fail_under = 42
