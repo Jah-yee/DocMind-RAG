@@ -1,0 +1,62 @@
+name: Docker Build
+
+# 从 ci-nightly 拆出来：它占 nightly 墙钟的 99%（429s/432s），而当时 schedule
+# 每天无条件重跑 —— 绝大多数夜晚 Dockerfile 根本没变。（ci-nightly 的 cron 现为每周一次。）
+# 改成"只有真的改了容器相关文件才构建"。
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - 'backend/Dockerfile'
+      - 'frontend/Dockerfile'
+      - 'backend/requirements*.txt'
+      - 'frontend/package*.json'
+      - '**/docker-compose*.yml'
+      - 'deploy/**'
+      - '.github/workflows/docker-build.yml'
+  pull_request:
+    paths:
+      - 'backend/Dockerfile'
+      - 'frontend/Dockerfile'
+      - 'backend/requirements*.txt'
+      - 'frontend/package*.json'
+      - '**/docker-compose*.yml'
+      - 'deploy/**'
+      - '.github/workflows/docker-build.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: docker-build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  docker-build:
+    name: Docker Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build backend image
+        uses: docker/build-push-action@v7
+        with:
+          context: backend
+          push: false
+          tags: docmind-backend:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build frontend image
+        uses: docker/build-push-action@v7
+        with:
+          context: frontend
+          push: false
+          tags: docmind-frontend:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
