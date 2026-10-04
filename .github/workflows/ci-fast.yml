@@ -72,6 +72,13 @@ jobs:
         working-directory: backend
         run: ruff check app/ tests/ scripts/
 
+      # 静态安全扫描前置到 PR：此前只在 nightly 跑，而 nightly 已连续红 ≥11 天，
+      # 等于这条门禁事实上不存在。bandit 已在 requirements-dev.txt，无需额外安装。
+      # 只阻断 medium+；low 档留给 nightly 仅报告。
+      - name: Static security scan (bandit, medium+)
+        working-directory: backend
+        run: bandit -r app/ -ll
+
       - name: Migration smoke test (SQLite)
         working-directory: backend
         run: |
