@@ -94,11 +94,14 @@ jobs:
         env:
           COVERAGE: ${{ matrix.coverage }}
         run: |
-          ARGS="tests/unit/ tests/behavior/ tests/integration/test_security_regressions.py tests/integration/test_api_auth.py -v --tb=short"
+          # 用 bash 数组而不是字符串变量：`pytest $ARGS` 会被 shellcheck 判为
+          # SC2086（未加引号的变量会做词分割/通配），而 `pytest "$ARGS"` 又会把
+          # 整串当成单个参数、pytest 找不到路径。数组是唯一同时满足两者的写法。
+          ARGS=(tests/unit/ tests/behavior/ tests/integration/test_security_regressions.py tests/integration/test_api_auth.py -v --tb=short)
           if [ "$COVERAGE" = "true" ]; then
-            python -m pytest $ARGS --cov=app --cov-report=xml --cov-report=term
+            python -m pytest "${ARGS[@]}" --cov=app --cov-report=xml --cov-report=term
           else
-            python -m pytest $ARGS
+            python -m pytest "${ARGS[@]}"
           fi
 
       # 只有 3.12 腿产出 backend/coverage.xml（3.11 腿不采集覆盖率）。
