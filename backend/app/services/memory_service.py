@@ -2,6 +2,7 @@
 Agent 记忆系统服务
 支持短期记忆、长期记忆、工作记忆和反思记忆
 """
+import asyncio
 import json
 import logging
 import math
@@ -316,6 +317,9 @@ class WorkingMemory:
         self.task_stack: list[dict[str, Any]] = []
         self.intermediate_results: dict[str, Any] = {}
         self.variables: dict[str, Any] = {}
+        # 中间结果 key -> 所属 run_id。读取时按 run 过滤，
+        # 防止上一轮/其他会话的同名步骤结果（如 "s1"）串扰当前 run。
+        self._result_run_ids: dict[str, str] = {}
 
     def set_state(self, key: str, value: Any) -> None:
         """设置状态"""
@@ -338,13 +342,34 @@ class WorkingMemory:
             return self.task_stack.pop()
         return None
 
-    def set_result(self, key: str, value: Any) -> None:
-        """设置中间结果"""
+    def set_result(self, key: str, value: Any, run_id: str | None = None) -> None:
+        """设置中间结果（传入 run_id 时标记该结果所属的 run）"""
         self.intermediate_results[key] = value
+        if run_id is None:
+            # 无 run 归属的结果不应被任何 run 作用域读到，解除旧标记
+            self._result_run_ids.pop(key, None)
+        else:
+            self._result_run_ids[key] = run_id
 
-    def get_result(self, key: str) -> Any:
-        """获取中间结果"""
+    def get_result(self, key: str, run_id: str | None = None) -> Any:
+        """获取中间结果（传入 run_id 时只命中该 run 写入的结果）"""
+        if run_id is not None and self._result_run_ids.get(key) != run_id:
+            return None
         return self.intermediate_results.get(key)
+
+    def get_results(self, run_id: str | None = None) -> dict[str, Any]:
+        """获取中间结果集合（传入 run_id 时只返回该 run 的结果）"""
+        if run_id is None:
+            return dict(self.intermediate_results)
+        return {
+            key: value
+            for key, value in self.intermediate_results.items()
+            if self._result_run_ids.get(key) == run_id
+        }
+
+    def adopt_results(self, run_id: str) -> None:
+        """把当前所有中间结果标记为属于指定 run（用于会话状态恢复）"""
+        self._result_run_ids = dict.fromkeys(self.intermediate_results, run_id)
 
     def set_variable(self, key: str, value: Any) -> None:
         """设置变量"""
@@ -367,6 +392,7 @@ class WorkingMemory:
         self.task_stack.clear()
         self.intermediate_results.clear()
         self.variables.clear()
+        self._result_run_ids.clear()
 
     def to_dict(self) -> dict:
         """转换为字典"""
@@ -684,6 +710,9 @@ class AgentMemorySystem:
                 lesson=result,
                 trigger=action
             )
+            # remember() 的保存发生在这条反思经验写入之前，需补一次落盘，
+            # 否则驱逐/重启会丢失 Redis 尚未见过的数据
+            await self._save_to_redis()
 
     def export(self) -> dict[str, Any]:
         """导出所有记忆"""
@@ -733,12 +762,40 @@ class AgentMemorySystem:
                 self.long_term.add(item)
 
 
-# 全局记忆系统实例
+# 全局记忆系统实例（按命名空间缓存，LRU 上限，防止无限增长）
+_MAX_MEMORY_SYSTEMS = 256
 memory_systems: dict[str, AgentMemorySystem] = {}
 
 
+def _evict_memory_system(agent_id: str) -> None:
+    """从缓存中驱逐一个记忆系统
+
+    驱逐前尽力把长期/反思记忆写回 Redis：
+    - 仅当实例已从 Redis 加载过（否则"空内存"写回会覆盖 Redis 中的已有数据）；
+    - 仅在事件循环可用时调度异步保存，避免驱逐静默丢弃 Redis 尚未见过的数据。
+    """
+    system = memory_systems.pop(agent_id, None)
+    if system is None or not system._loaded:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        logger.debug(f"无事件循环，驱逐记忆系统 '{agent_id}' 时跳过持久化")
+        return
+    loop.create_task(system._save_to_redis())
+
+
 def get_memory_system(agent_id: str = "default") -> AgentMemorySystem:
-    """获取或创建记忆系统"""
-    if agent_id not in memory_systems:
-        memory_systems[agent_id] = AgentMemorySystem(agent_id)
+    """获取或创建记忆系统（LRU：缓存上限 _MAX_MEMORY_SYSTEMS）"""
+    system = memory_systems.get(agent_id)
+    if system is not None:
+        # 命中即刷新为最近使用
+        memory_systems.pop(agent_id)
+        memory_systems[agent_id] = system
+        return system
+
+    while len(memory_systems) >= _MAX_MEMORY_SYSTEMS:
+        _evict_memory_system(next(iter(memory_systems)))
+
+    memory_systems[agent_id] = AgentMemorySystem(agent_id)
     return memory_systems[agent_id]

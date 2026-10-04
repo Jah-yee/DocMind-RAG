@@ -89,8 +89,31 @@ async def test_superuser_crosses_org_boundary():
 
 
 @pytest.mark.asyncio
-async def test_admin_crosses_org_boundary():
+async def test_tenant_admin_does_not_cross_org_boundary():
+    """租户管理员（role="admin"）不再是跨组织的旁路。
+
+    契约变更（安全修复 S3）：`role` 是用户表上的**全局**字段，任何组织都可能
+    存在 role=admin 的用户，因此 `and current_user.role != "admin"` 这一条会让
+    任一租户管理员读取其他组织（本例 org 999）的文档。
+
+    它同时也覆盖了"无组织用户不得读文档"这一 fail-closed 语义 ——
+    `get_document_for_user` 不再用 `organization_id or 1` 兜底。
+    超管的跨组织访问仍然放行（见上一个用例），那是全局角色。
+    """
     document = _document(org_id=999)
+
+    with pytest.raises(AuthorizationError) as exc:
+        await get_document_for_user(
+            _db_returning(document), _user(org_id=1, role="admin"), "doc-1"
+        )
+
+    assert exc.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_tenant_admin_reads_own_org_document():
+    """回归对照：租户管理员读本组织文档必须照常放行。"""
+    document = _document(org_id=1)
 
     result = await get_document_for_user(
         _db_returning(document), _user(org_id=1, role="admin"), "doc-1"

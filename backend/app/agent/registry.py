@@ -555,6 +555,16 @@ class ToolRegistry:
             elapsed = (time.perf_counter() - start) * 1000
             result = ToolResult.fail(code=e.code, message=e.message, raw=e.raw,
                                       meta=ToolMeta(latency_ms=elapsed, tool_name=name))
+        except TimeoutError:
+            # Classify explicitly so the retry loop can select the "timeout" policy
+            # instead of falling through to the unknown/fatal default.
+            elapsed = (time.perf_counter() - start) * 1000
+            logger.warning("Tool '%s' timed out after %.1fs", name, elapsed / 1000)
+            result = ToolResult.fail(
+                code="timeout",
+                message=f"工具 {name} 执行超时（{entry.timeout or 30.0}s）",
+                meta=ToolMeta(latency_ms=elapsed, tool_name=name),
+            )
         except Exception as e:
             elapsed = (time.perf_counter() - start) * 1000
             logger.error("Tool '%s' failed: %s", name, e, exc_info=True)

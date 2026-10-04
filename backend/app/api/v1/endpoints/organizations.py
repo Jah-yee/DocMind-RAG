@@ -27,6 +27,19 @@ from app.services.organization_service import organization_service
 
 router = APIRouter()
 
+
+def _ensure_org_membership(current_user: User, org_id: int) -> None:
+    """S1 安全加固：非超管必须属于目标组织，否则抛出 403。
+
+    permission_required(organization_id_param=...) 只校验调用者是否持有权限，
+    而全局 role=admin 的用户持有整套 SysAdmin 权限（permission_service.py），
+    因此仅靠该依赖无法阻止跨组织访问；组织成员资格必须在这里显式校验。
+    """
+    if getattr(current_user, "is_superuser", False):
+        return
+    if current_user.organization_id != org_id:
+        raise AuthorizationError("无权访问该组织的数据")
+
 @router.get("/tree", response_model=dict, summary="获取组织架构树", dependencies=[Depends(permission_required([PermissionType.VIEW_ORGANIZATION]))])
 async def get_organization_tree(
     current_user: User = Depends(get_current_user),
@@ -87,6 +100,7 @@ async def get_organization_stats(
     db: AsyncSession = Depends(get_db)
 ):
     """获取组织的成员数、文档数等统计数据"""
+    _ensure_org_membership(current_user, org_id)
     stats = await organization_service.get_org_stats(db, org_id)
     return {
         "success": True,
@@ -155,6 +169,7 @@ async def get_organization(
     db: AsyncSession = Depends(get_db)
 ):
     """获取组织信息"""
+    _ensure_org_membership(current_user, org_id)
     query = select(Organization).where(Organization.id == org_id)
     result = await db.execute(query)
     org = result.scalar_one_or_none()
@@ -170,6 +185,7 @@ async def update_organization(
     db: AsyncSession = Depends(get_db)
 ):
     """更新组织信息，包括拖拽引起的父级和排序变更"""
+    _ensure_org_membership(current_user, org_id)
     try:
         updated_org = await organization_service.update_organization(
             db, org_id, org_in.model_dump(exclude_unset=True)
@@ -195,6 +211,14 @@ async def batch_delete_organizations(
     if not ids:
         return {"success": True, "message": "无选中项"}
 
+    # S1 安全加固：非超管必须对每一个待删除组织都有成员资格，杜绝跨组织批量删除
+    try:
+        org_ids = [int(i) for i in ids]
+    except (TypeError, ValueError):
+        raise ValidationError("无效的组织ID")
+    for target_org_id in org_ids:
+        _ensure_org_membership(current_user, target_org_id)
+
     success = await organization_service.batch_delete_organizations(db, ids)
     if success:
         await audit_service.log_activity(
@@ -216,6 +240,7 @@ async def delete_organization(
     db: AsyncSession = Depends(get_db)
 ):
     """彻底删除组织及其所有子组织"""
+    _ensure_org_membership(current_user, org_id)
     success = await organization_service.delete_organization_thoroughly(db, org_id)
     if success:
         await audit_service.log_activity(
@@ -237,6 +262,7 @@ async def get_organization_members(
     db: AsyncSession = Depends(get_db)
 ):
     """获取组织成员列表"""
+    _ensure_org_membership(current_user, org_id)
     try:
         # 检查组织是否存在
         org_query = select(Organization).where(Organization.id == org_id)
@@ -272,6 +298,7 @@ async def add_organization_member(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
+    _ensure_org_membership(current_user, org_id)
     org = (await db.execute(select(Organization).where(Organization.id == org_id))).scalar_one_or_none()
     if not org:
         raise NotFoundError("组织不存在")
@@ -316,6 +343,7 @@ async def update_organization_member_role(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
+    _ensure_org_membership(current_user, org_id)
     if role not in ["user", "admin"]:
         raise ValidationError("无效角色")
 
@@ -346,6 +374,7 @@ async def remove_organization_member(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
+    _ensure_org_membership(current_user, org_id)
     user = (await db.execute(select(User).where(User.id == user_id, User.organization_id == org_id))).scalar_one_or_none()
     if not user:
         raise NotFoundError("组织成员不存在")
@@ -373,6 +402,7 @@ async def get_organization_documents(
     db: AsyncSession = Depends(get_db)
 ):
     """获取组织关联的知识库文档"""
+    _ensure_org_membership(current_user, org_id)
     try:
         from app.models.document import Document
         query = select(Document).where(Document.organization_id == org_id)

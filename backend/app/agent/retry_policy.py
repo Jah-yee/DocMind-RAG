@@ -102,6 +102,9 @@ RETRY_POLICIES: dict[str, RetryPolicy] = {
     "not_found": RetryPolicy(
         retryable=False, action="fatal",
     ),
+    "hook_error": RetryPolicy(
+        retryable=False, action="fatal",
+    ),
     "permission_denied": RetryPolicy(
         retryable=False, action="fatal",
     ),
@@ -134,6 +137,17 @@ RETRY_POLICIES: dict[str, RetryPolicy] = {
     ),
     "doom_loop_detected": RetryPolicy(
         retryable=False, action="fatal",
+    ),
+    # Registry fallback for an unclassified handler exception. Declared explicitly
+    # (same shape as the get_policy fallback) so the registry's own codes are all
+    # visible in this table rather than resolving silently through the default.
+    "unknown": RetryPolicy(
+        retryable=False, action="fatal",
+    ),
+    # Alias: the registry emits "rate_limited"; this spelling appeared in an
+    # earlier contract. Keep both so a mismatch cannot silently become fatal.
+    "rate_limit": RetryPolicy(
+        retryable=True, action="repeat", max_retries=2,
     ),
 }
 

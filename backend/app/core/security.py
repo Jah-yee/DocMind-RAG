@@ -50,6 +50,21 @@ def get_user_org_id(current_user: User) -> int | None:
     )
 
 
+def require_organization(current_user: User) -> int:
+    """Resolve the caller's organization, failing closed when it is absent.
+
+    S3 安全加固：此前多处使用 `current_user.organization_id or 1` 兜底，
+    会把无组织用户静默归入 1 号组织，使其可读写其他租户的数据。
+    现在无组织一律拒绝（403）；超级管理员是全局角色，无组织时仍兜底为 1。
+    """
+    org_id = get_user_org_id(current_user)
+    if org_id is not None:
+        return int(org_id)
+    if getattr(current_user, "is_superuser", False):
+        return 1
+    raise AuthorizationError("当前用户未加入任何组织，无权访问组织数据")
+
+
 async def get_document_for_user(
     db: AsyncSession,
     current_user: User,
@@ -69,12 +84,13 @@ async def get_document_for_user(
     if not document:
         raise NotFoundError("文档不存在")
 
-    org_id = get_user_org_id(current_user) or 1
-    if (
-        not current_user.is_superuser
-        and current_user.role != "admin"
-        and document.organization_id != org_id
-    ):
+    # S3 安全加固：fail closed —— 无组织用户不再兜底到 1 号组织；
+    # 非超管（含全局 role=admin 的租户管理员）只能访问本组织的文档。
+    # 组织经由 get_user_org_id() 解析，因此兼容 token_organization_id 回退。
+    if current_user.is_superuser:
+        return document
+    org_id = get_user_org_id(current_user)
+    if org_id is None or document.organization_id != org_id:
         raise AuthorizationError("无权访问该文档")
     return document
 

@@ -217,6 +217,10 @@ async def execute_workflow(
     # 从请求体获取输入数据
     input_data = body if body else {}
 
+    # 安全修复（R0）：知识库检索范围由服务端根据认证用户推导（参考 /knowledge/search），
+    # 忽略请求体中客户端可传的 organization_id，防止跨租户读取。
+    effective_org_id = current_user.organization_id or 1
+
     # 创建执行记录
     execution = WorkflowExecution(
         workflow_id=workflow_id,
@@ -234,7 +238,7 @@ async def execute_workflow(
                 from app.schemas.workflow import WorkflowConfig as WConfig
                 config = WConfig(**workflow.flow_data)
 
-                engine = WorkflowEngine(config)
+                engine = WorkflowEngine(config, organization_id=effective_org_id)
 
                 # 收集所有事件
                 events_queue = asyncio.Queue()
@@ -327,7 +331,7 @@ async def execute_workflow(
         from app.schemas.workflow import WorkflowConfig as WConfig
         config = WConfig(**workflow.flow_data)
 
-        engine = WorkflowEngine(config)
+        engine = WorkflowEngine(config, organization_id=effective_org_id)
 
         execution.status = "running"
         execution.started_at = datetime.now()

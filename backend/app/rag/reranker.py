@@ -17,6 +17,29 @@ logger = logging.getLogger(__name__)
 
 # ── Local cross-encoder (lazy singleton) ─────────────────────────
 
+def _hit_text(hit: dict) -> str:
+    """提取命中片段的正文文本。
+
+    修复（R1）：检索后处理结果（HybridRetriever._post_process）以 content/text
+    键携带正文，不含 _source；原始 ES 命中则以 _source.content/chunk_text 携带。
+    两种形态都要兼容，否则重排序器收到空文本、排序退化为任意顺序。
+    """
+    text = hit.get("content") or hit.get("chunk_text") or hit.get("text")
+    if text:
+        return text
+    src = hit.get("_source") or {}
+    return src.get("content") or src.get("chunk_text") or ""
+
+
+def _hit_filename(hit: dict) -> str:
+    """提取命中片段的文件名（兼容后处理结果与原始 ES 命中两种形态）。"""
+    text = hit.get("filename")
+    if text:
+        return text
+    src = hit.get("_source") or {}
+    return src.get("filename") or "未知"
+
+
 @lru_cache(maxsize=1)
 def _get_cross_encoder(model_name: str | None = None):
     """Load the cross-encoder model once and cache it for the process lifetime.
@@ -49,8 +72,7 @@ async def _rerank_local(query: str, candidates: list[dict], top_n: int) -> list[
 
     pairs = []
     for h in candidates:
-        src = h.get("_source") or {}
-        passage = (src.get("content") or src.get("chunk_text") or "")[:512]
+        passage = _hit_text(h)[:512]
         pairs.append([query, passage])
 
     try:
@@ -84,7 +106,7 @@ async def _rerank_zhipu(query: str, candidates: list[dict], top_n: int) -> list[
         import httpx
 
         documents = [
-            (h.get("_source") or {}).get("chunk_text", "")[:1000]
+            _hit_text(h)[:1000]
             for h in candidates
         ]
         async with httpx.AsyncClient() as client:
@@ -127,9 +149,8 @@ async def _rerank_llm(query: str, candidates: list[dict], top_n: int, llm_client
 
     brief = []
     for idx, h in enumerate(candidates, 1):
-        src = h.get("_source") or {}
-        text = (src.get("content") or "")[:500]
-        brief.append(f"[{idx}] 文件:{src.get('filename', '未知')}\n内容:{text}")
+        text = _hit_text(h)[:500]
+        brief.append(f"[{idx}] 文件:{_hit_filename(h)}\n内容:{text}")
 
     prompt = (
         "你是检索重排器。请根据用户问题判断候选片段相关性，"

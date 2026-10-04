@@ -11,6 +11,7 @@ This bridge provides the agent with:
 """
 
 import logging
+import uuid
 from typing import Any
 
 from app.core.prometheus import AGENT_MEMORY_RECALLS
@@ -27,7 +28,11 @@ class AgentMemoryBridge:
     """Bridges AgentMemorySystem into the PER agent loop.
 
     Scoped by (organization_id, user_id, agent_id) so memories are
-    isolated per user and per agent persona.
+    isolated per user and per agent persona. Working-memory step results are
+    additionally scoped to this bridge's current run (call reset_working() at
+    the start of each run), so results cannot bleed across turns or
+    conversations. When agent_id falls back to "default" the namespace is
+    per-request; pass session_id for cross-turn session memory.
 
     Usage:
         bridge = AgentMemoryBridge(
@@ -35,6 +40,7 @@ class AgentMemoryBridge:
             organization_id=org_id,
             user_id=user_id,
         )
+        bridge.reset_working()  # start of a new run
         context = await bridge.get_context_for_query("分析财报")
         await bridge.record_step(plan_step)
         await bridge.record_interaction(query, answer)
@@ -45,14 +51,29 @@ class AgentMemoryBridge:
         agent_id: str = "default",
         organization_id: int = 1,
         user_id: int = 0,
+        session_id: str | None = None,
     ):
-        # Namespace: one memory system per (org, user, agent)
-        namespace = f"{organization_id}:{user_id}:{agent_id}"
+        # 会话级命名空间：显式 session_id 优先，与 service.py 的 "session:<id>" 约定一致
+        if session_id:
+            agent_id = f"session:{session_id}"
+
+        # 命名空间：一个 (org, user, agent) 一个记忆系统。
+        # agent_id 回落到 "default"（如 service.py 未拿到 session_id）时，若命名空间
+        # 只到 (org, user)，该用户所有会话会共享工作记忆（跨会话串扰）。此时退化为
+        # “每次请求独立”的命名空间；需要跨轮记忆的调用方必须传入 session_id 或显式 agent_id。
+        if agent_id in ("", "default"):
+            namespace = f"{organization_id}:{user_id}:{agent_id}:{uuid.uuid4().hex[:12]}"
+        else:
+            namespace = f"{organization_id}:{user_id}:{agent_id}"
+
         self.system: AgentMemorySystem = get_memory_system(namespace)
         self.agent_id = agent_id
         self.organization_id = organization_id
         self.user_id = user_id
         self._embedding_ready = False
+        # 本次运行的 run 作用域：工作记忆的读写都带上它，
+        # 防止上一轮（或上一会话）的步骤结果串到当前 run。
+        self._run_id = uuid.uuid4().hex[:12]
 
     # ── Lifecycle ──
 
@@ -123,13 +144,17 @@ class AgentMemoryBridge:
 
     # ── Working memory (Phase 2: Execution) ──
 
-    def store_step_result(self, step_id: str, result: dict[str, Any]) -> None:
-        """Store a completed plan step result in WorkingMemory."""
-        self.system.working.set_result(step_id, result)
+    def store_step_result(self, step_id: str, result: dict[str, Any], run_id: str | None = None) -> None:
+        """Store a completed plan step result in WorkingMemory (current run)."""
+        self.system.working.set_result(
+            step_id, result, run_id=run_id if run_id is not None else self._run_id
+        )
 
-    def get_step_result(self, step_id: str) -> dict[str, Any] | None:
-        """Retrieve a previous step result for dependent steps."""
-        return self.system.working.get_result(step_id)
+    def get_step_result(self, step_id: str, run_id: str | None = None) -> dict[str, Any] | None:
+        """Retrieve a previous step result for dependent steps (current run only)."""
+        return self.system.working.get_result(
+            step_id, run_id=run_id if run_id is not None else self._run_id
+        )
 
     def push_task(self, step_id: str, description: str) -> None:
         """Push a plan step onto the task stack."""
@@ -143,9 +168,11 @@ class AgentMemoryBridge:
         """Set a variable in WorkingMemory for template resolution."""
         self.system.working.set_variable(key, value)
 
-    def get_all_results(self) -> dict[str, Any]:
-        """Get all intermediate results for reflection."""
-        return dict(self.system.working.intermediate_results)
+    def get_all_results(self, run_id: str | None = None) -> dict[str, Any]:
+        """Get all intermediate results for reflection (current run only)."""
+        return self.system.working.get_results(
+            run_id=run_id if run_id is not None else self._run_id
+        )
 
     # ── Experience recording (Phase 2 & 3) ──
 
@@ -206,6 +233,8 @@ class AgentMemoryBridge:
             self.system.working.state = w.get("state", {})
             self.system.working.task_stack = w.get("task_stack", [])
             self.system.working.intermediate_results = w.get("intermediate_results", {})
+            # 恢复的中间结果归属当前 run，否则按 run 隔离的读取会看不到它们
+            self.system.working.adopt_results(self._run_id)
             self.system.working.variables = w.get("variables", {})
         if "short_term" in state:
             self.system.short_term.clear()
@@ -226,5 +255,6 @@ class AgentMemoryBridge:
             self.system.interaction_count = state["interaction_count"]
 
     def reset_working(self) -> None:
-        """Clear working memory for a new conversation turn."""
+        """Clear working memory and start a fresh run scope for a new conversation turn."""
         self.system.working.clear()
+        self._run_id = uuid.uuid4().hex[:12]

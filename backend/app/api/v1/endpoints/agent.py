@@ -30,7 +30,7 @@ from app.agent.service import agent_service
 from app.agent.skills import skill_manager
 from app.core.database import AsyncSessionLocal, get_db
 from app.core.prometheus import AGENT_FEEDBACK_TOTAL
-from app.core.security import get_current_user
+from app.core.security import get_current_user, require_organization
 from app.exceptions import NotFoundError, ValidationError
 from app.models.chat import ChatMessage, ChatSession, ChatSessionStatus, MessageType
 from app.models.user import User
@@ -94,6 +94,10 @@ async def agent_chat(
     Events: thinking, plan_start, plan_step, plan_complete,
             tool_call, tool_result, tool_error, reflection, chunk, done
     """
+    # S3 安全加固：无组织用户直接 403（必须在进入 SSE 流之前抛出），
+    # 不再兜底到 1 号组织去读取其他租户的数据
+    effective_org_id = require_organization(current_user)
+
     async def event_stream():
         try:
             # Build AgentConfig from request
@@ -122,7 +126,7 @@ async def agent_chat(
             async for event in agent_service.chat(
                 query=body.query,
                 history=history,
-                organization_id=current_user.organization_id or 1,
+                organization_id=effective_org_id,
                 user_id=current_user.id,
                 session_id=body.session_id,
                 config=config,
@@ -579,14 +583,36 @@ async def _save_session_interaction(
 ) -> str | None:
     """Save the user query and assistant response as messages in the session.
 
-    Returns: the assistant message ID (or None if no response / on error).
+    S6 安全加固：会话归属按 user_id 校验（与 _load_session_messages 一致），
+    绝不允许把消息写进其他用户的会话。
+
+    Returns: the assistant message ID (or None if the session is not owned
+    by the caller / there is no response / on error).
     """
     try:
         async with AsyncSessionLocal() as session:
-            # Ensure session exists
-            stmt = select(ChatSession).where(ChatSession.id == session_id)
+            # S6 安全加固：按 id + user_id 校验会话归属（与 _load_session_messages 一致），
+            # 绝不允许把消息写进其他用户的会话
+            stmt = select(ChatSession).where(
+                ChatSession.id == session_id,
+                ChatSession.user_id == user_id,
+            )
             result = await session.execute(stmt)
-            if not result.scalar_one_or_none():
+            existing = result.scalar_one_or_none()
+
+            if existing is None:
+                # id 可能已被其他用户的会话占用：确认后拒绝写入（也避免主键冲突）
+                occupied = (
+                    await session.execute(
+                        select(ChatSession.id).where(ChatSession.id == session_id)
+                    )
+                ).scalar_one_or_none()
+                if occupied is not None:
+                    logger.warning(
+                        f"Refusing to save interaction into session {session_id} "
+                        f"not owned by user {user_id}"
+                    )
+                    return None
                 new_session = ChatSession(
                     id=session_id,
                     user_id=user_id,
@@ -616,8 +642,7 @@ async def _save_session_interaction(
                 session.add(assistant_msg)
 
             # Update session title from first message
-            existing = (await session.execute(stmt)).scalar_one_or_none()
-            if existing and (not existing.title or existing.title == "New Agent Session"):
+            if existing is not None and (not existing.title or existing.title == "New Agent Session"):
                 existing.title = query[:80]
                 existing.updated_at = func.now()
 

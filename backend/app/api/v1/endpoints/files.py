@@ -5,7 +5,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, Request, Up
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
-from app.core.security import get_current_user, permission_required
+from app.core.security import get_current_user, permission_required, require_organization
 from app.exceptions import AppError
 from app.models.notification import Notification
 from app.models.rbac import PermissionType
@@ -33,7 +33,8 @@ async def upload_file(
     try:
         current_user = await db.merge(current_user)
         tag_list = [tag.strip() for tag in tags.split(",") if tag.strip()] if tags else None
-        organization_id = str(current_user.organization_id) if current_user.organization_id else "1"
+        # S3 安全加固：无组织用户直接 403，不再兜底到 "1"
+        organization_id = str(require_organization(current_user))
 
         result = await file_service.upload_file(
             file=file, organization_id=organization_id,
@@ -49,6 +50,8 @@ async def upload_file(
         db.add(notification)
         await db.commit()
         return FileUploadResponse(**result)
+    except AppError:
+        raise
     except Exception as e:
         raise AppError(str(e))
 
@@ -100,12 +103,15 @@ async def upload_file_chunk(
     db: AsyncSession = Depends(get_db)
 ):
     try:
-        organization_id = str(current_user.organization_id) if current_user.organization_id else "1"
+        # S3 安全加固：无组织用户直接 403，不再兜底到 "1"
+        organization_id = str(require_organization(current_user))
         result = await file_service.upload_chunk(
             chunk_data=chunk_data, chunk_index=chunk_index, total_chunks=total_chunks,
             file_name=file_name, file_hash=file_hash, organization_id=organization_id, user_id=current_user.id
         )
         return FileChunkUploadResponse(**result)
+    except AppError:
+        raise
     except Exception as e:
         raise AppError(str(e))
 
@@ -119,11 +125,14 @@ async def get_document_list(
     db: AsyncSession = Depends(get_db)
 ):
     try:
-        organization_id = str(current_user.organization_id) if current_user.organization_id else "1"
+        # S3 安全加固：无组织用户直接 403，不再兜底到 "1"
+        organization_id = str(require_organization(current_user))
         result = await file_service.get_document_list(
             organization_id=organization_id, user_id=user_id, status=status, skip=skip, limit=limit
         )
         return FileListResponse(**result)
+    except AppError:
+        raise
     except Exception as e:
         raise AppError(str(e))
 
@@ -135,7 +144,8 @@ async def delete_document(
     db: AsyncSession = Depends(get_db)
 ):
     try:
-        organization_id = str(current_user.organization_id) if current_user.organization_id else "1"
+        # S3 安全加固：无组织用户直接 403，不再兜底到 "1"
+        organization_id = str(require_organization(current_user))
         success = await file_service.delete_document(
             document_id=document_id, organization_id=organization_id, user_id=current_user.id
         )
@@ -149,6 +159,8 @@ async def delete_document(
                 request=request
             )
         return FileDeleteResponse(success=success, message="删除成功" if success else "删除失败")
+    except AppError:
+        raise
     except Exception as e:
         raise AppError(str(e))
 

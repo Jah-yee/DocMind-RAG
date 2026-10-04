@@ -40,6 +40,16 @@ from app.rag.retriever import HybridRetriever
 logger = logging.getLogger(__name__)
 
 
+def _source_content(hit: dict[str, Any]) -> str:
+    """兜底读取原始 ES 命中的正文（后处理结果已带 content 键）。"""
+    return (hit.get("_source") or {}).get("content", "") or ""
+
+
+def _source_filename(hit: dict[str, Any]) -> str:
+    """兜底读取原始 ES 命中的文件名（后处理结果已带 filename 键）。"""
+    return (hit.get("_source") or {}).get("filename", "未知")
+
+
 class RAGPipeline:
     """Composes retrieval, reranking, caching, and generation into a single pipeline."""
 
@@ -53,7 +63,9 @@ class RAGPipeline:
         self.rerank_client = rerank_client
         self.retriever = HybridRetriever(openai_client=openai_client, embedding_client=embedding_client)
         self.cache = RetrievalCache()
-        self.semantic_cache = SemanticCache()
+        # 修复（R4）：检索缓存使用独立命名空间，避免 answer="" 的检索条目
+        # 被问答链路（chat_service）按语义相似度命中后返回空回答。
+        self.semantic_cache = SemanticCache.for_retrieval()
         self.metrics = RAGMetrics()
 
     async def get_embedding(self, text: str) -> list[float]:
@@ -194,8 +206,11 @@ class RAGPipeline:
             seen_ids: set[str] = set()
             for sq_results in all_results:
                 for hit in sq_results:
-                    chunk_id = hit.get("_id") or hit.get("chunk_id", "")
-                    doc_id = (hit.get("_source") or {}).get("doc_id", "")
+                    # 修复（R2）：后处理结果携带 chunk_id（见 HybridRetriever._post_process），
+                    # 兜底兼容原始 ES 命中的 _id / _source.doc_id，
+                    # 否则 dedup_key 恒为空、跨子查询的重复 chunk 会占满最终 top_k。
+                    chunk_id = hit.get("chunk_id") or hit.get("_id") or ""
+                    doc_id = hit.get("document_id") or (hit.get("_source") or {}).get("doc_id", "")
                     dedup_key = chunk_id or doc_id
                     if dedup_key and dedup_key in seen_ids:
                         continue
@@ -210,15 +225,16 @@ class RAGPipeline:
                 if debug and debug_info is not None and pre_rerank:
                     debug_info["rerank_result"] = [
                         {
-                            "id": r.get("_id"),
-                            "filename": (r.get("_source") or {}).get("filename", "未知"),
-                            "score": round(float(r.get("_score", 0)), 4),
-                            "snippet": ((r.get("_source") or {}).get("content", "") or "")[:200],
+                            "id": r.get("chunk_id") or r.get("_id"),
+                            "filename": r.get("filename") or _source_filename(r),
+                            "score": round(float(r.get("score") if r.get("score") is not None else r.get("_score", 0)), 4),
+                            "snippet": (r.get("content") or r.get("snippet") or _source_content(r))[:200],
                         }
                         for r in result[:top_k]
                     ]
                     debug_info["rerank_reorder"] = [
-                        {"id": r.get("_id"), "filename": (r.get("_source") or {}).get("filename", "")}
+                        {"id": r.get("chunk_id") or r.get("_id"),
+                         "filename": r.get("filename") or _source_filename(r)}
                         for r in result[:top_k]
                     ]
                 result = result[:top_k]
@@ -226,6 +242,7 @@ class RAGPipeline:
             if not document_ids:
                 await self.cache.set(query, organization_id, top_k, result)
             if query_vector and result:
+                # 检索缓存条目 answer 为空（仅 sources），写入检索专用命名空间（R4）
                 await self.semantic_cache.set(
                     query, query_vector, "", result, organization_id=organization_id
                 )

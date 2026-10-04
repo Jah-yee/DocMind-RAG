@@ -190,6 +190,11 @@ class LLMNodeExecutor(NodeExecutor):
 class KnowledgeSearchNodeExecutor(NodeExecutor):
     """知识库搜索节点执行器"""
 
+    # 安全修复（R0）：检索的租户范围由 WorkflowEngine 在创建执行器时注入
+    # （见 WorkflowEngine.get_executor），绝不从请求体（state["input"]）读取，
+    # 防止任意用户通过 input.organization_id 跨租户读取知识库。
+    organization_id: int | None = None
+
     async def execute(self, state: WorkflowState) -> dict[str, Any]:
         from app.services.rag_service import rag_service
 
@@ -206,9 +211,10 @@ class KnowledgeSearchNodeExecutor(NodeExecutor):
         top_k = self.node.data.get("topK", self.node.data.get("top_k", 5))
         score_threshold = self.node.data.get("scoreThreshold", self.node.data.get("score_threshold", 0.5))
 
-        # 搜索知识库
-        organization_id = state.get("input", {}).get("organization_id", 1)
-        docs = await rag_service.search_knowledge_base(query, organization_id=organization_id, top_k=top_k)
+        # 搜索知识库（安全修复：检索范围取服务端注入的 organization_id，
+        # 忽略输入中客户端可控的同名字段）
+        organization_id = self.organization_id if self.organization_id is not None else 1
+        docs, _ = await rag_service.search_knowledge_base(query, organization_id=organization_id, top_k=top_k)
 
         # 过滤低相关性结果
         filtered_docs = [d for d in docs if d.get("score", 0) >= score_threshold]
@@ -669,9 +675,12 @@ class RouterNodeExecutor(NodeExecutor):
 class WorkflowEngine:
     """工作流引擎 - 基于 LangGraph"""
 
-    def __init__(self, workflow_config: WorkflowConfig, llm_config: dict[str, Any] = None):
+    def __init__(self, workflow_config: WorkflowConfig, llm_config: dict[str, Any] = None, organization_id: int | None = None):
         self.config = workflow_config
         self.llm_config = llm_config or {}
+        # 安全修复（R0）：调用者所属组织，用于知识库检索的租户隔离。
+        # 由 API 层从认证用户推导后注入，客户端请求体不可控。
+        self.organization_id = organization_id
         self.nodes = {node.id: node for node in workflow_config.nodes}
         self.edges = workflow_config.edges
         self.node_results: dict[str, NodeResult] = {}
@@ -709,7 +718,11 @@ class WorkflowEngine:
         if not executor_class:
             raise ValueError(f"Unknown node type: {node.type}")
 
-        return executor_class(node, self.llm_config)
+        executor = executor_class(node, self.llm_config)
+        # 安全修复（R0）：把引擎级组织范围注入知识库检索节点
+        if isinstance(executor, KnowledgeSearchNodeExecutor):
+            executor.organization_id = self.organization_id
+        return executor
 
     def build_graph(self) -> StateGraph:
         """构建 LangGraph 状态图"""

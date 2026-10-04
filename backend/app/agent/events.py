@@ -55,8 +55,13 @@ class AgentEvent:
     tool_call_id: str = ""
     tool_duration_ms: float = 0.0
 
+    # Failure classification — read by Executor's retry loop to pick a RetryPolicy.
+    # Distinct from `reflection_result`, which is a pass/retry/replan/escalate verdict.
+    error_type: str = ""
+
     # Plan context
     plan_id: str = ""
+    plan_goal: str = ""
     plan_step_id: str = ""
     plan_progress: float = -1.0  # -1 = not set; >= 0 = explicit progress value
     dependencies: list[str] = field(default_factory=list)
@@ -99,6 +104,8 @@ class AgentEvent:
 
         if self.plan_id:
             d["plan_id"] = self.plan_id
+        if self.plan_goal:
+            d["plan_goal"] = self.plan_goal
         if self.plan_step_id:
             d["plan_step_id"] = self.plan_step_id
         if self.plan_progress >= 0:
@@ -129,6 +136,9 @@ class AgentEvent:
             d["retry_attempt"] = self.retry_attempt
         if self.retry_hint:
             d["retry_hint"] = self.retry_hint
+
+        if self.error_type:
+            d["error_type"] = self.error_type
 
         if self.iteration:
             d["iteration"] = self.iteration
