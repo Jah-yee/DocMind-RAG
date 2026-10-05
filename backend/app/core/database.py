@@ -64,8 +64,17 @@ async def _warn_if_collation_differs() -> None:
         logger.debug(f"collation 检查跳过: {str(e)}")
 
 
-async def _database_state(conn) -> tuple[int, bool]:
-    """返回 (库里的表数量, 是否存在 alembic_version 表)，兼容 MySQL 与 SQLite。"""
+async def _database_state(conn) -> tuple[int, int | None]:
+    """返回 (库里的表数量, alembic_version 里的 revision 行数)，兼容 MySQL 与 SQLite。
+
+    第二项为 None 表示 alembic_version 表不存在；表存在但 0 行则返回 0。
+    两者必须区分（issue #154）：`alembic_version` 表**存在但为空**的库常见于
+    create_all 建库后残留的空表，它和「没有这张表」一样都不是迁移建库。
+    判据是「表里有没有 revision 行」，不是「表是否存在」。
+
+    取行数用 COUNT(*)，不触碰列名/约束，因此表结构被改过也能安全求值；
+    表不存在时不会去查行数，避免抛异常。
+    """
     if conn.dialect.name == "mysql":
         table_count = (await conn.execute(text(
             "SELECT COUNT(*) FROM information_schema.tables "
@@ -83,7 +92,23 @@ async def _database_state(conn) -> tuple[int, bool]:
             "SELECT COUNT(*) FROM sqlite_master "
             "WHERE type = 'table' AND name = 'alembic_version'"
         ))).scalar())
-    return int(table_count), has_alembic_version
+
+    if not has_alembic_version:
+        return int(table_count), None
+
+    revision_count = (await conn.execute(text(
+        "SELECT COUNT(*) FROM alembic_version"
+    ))).scalar() or 0
+    return int(table_count), int(revision_count)
+
+
+# 「非迁移建库」告警的修复指引。单独成串，两条告警（无表 / 空表）共用。
+_ALEMBIC_ADOPT_HINT = (
+    "\n修复步骤：\n"
+    "  1. python scripts/check_schema.py           # 先核对库现状与模型的漂移\n"
+    "  2. alembic stamp <与库现状一致的 revision>   # 给现有 schema 盖上版本号\n"
+    "  3. alembic upgrade head                     # 让迁移补齐剩余变更"
+)
 
 
 async def init_db():
@@ -93,8 +118,9 @@ async def init_db():
 
     自 issue #150 起，create_all 仅在空库上执行：它不会给已有表补列，在非空库上
     运行只会在缺表时静默造出与迁移路径口径不同的表——这正是 issue #150 schema
-    漂移的「另一半」来源。非空库会被跳过：有 alembic_version 说明 schema 归迁移
-    管；没有则打一条漂移告警（该库不是迁移建库）。
+    漂移的「另一半」来源。非空库会被跳过：alembic_version 里有 revision 记录
+    说明 schema 归迁移管；表缺失**或表存在但 0 行**都视为非迁移建库
+    （issue #154：空表恰是 create_all 建库的常见残留形态），打漂移告警。
     """
     try:
         import os
@@ -107,16 +133,27 @@ async def init_db():
             return
 
         async with engine.connect() as conn:
-            table_count, has_alembic_version = await _database_state(conn)
+            table_count, revision_count = await _database_state(conn)
 
         if table_count > 0:
-            if has_alembic_version:
-                logger.info("数据库非空且存在 alembic_version，schema 由迁移管理，跳过 create_all")
-            else:
+            if revision_count:
+                logger.info(
+                    f"数据库非空且 alembic_version 有 {revision_count} 条 revision 记录，"
+                    "schema 由迁移管理，跳过 create_all（可用 python scripts/check_schema.py "
+                    "核对 revision 与迁移 head 是否一致）"
+                )
+            elif revision_count == 0:
                 logger.warning(
-                    "数据库非空但没有 alembic_version —— 不是迁移建库。create_all 不会给已有表"
-                    "补列/改列，为避免静默造出与迁移路径分叉的 schema，已跳过。建议运行"
-                    " python scripts/check_schema.py 核对漂移，并改用 Alembic 接管 schema。"
+                    "数据库非空，alembic_version 表存在但没有 revision 记录 —— 该库不是迁移"
+                    "建库（如 create_all 建库后残留的空表），schema 不由 Alembic 管理。"
+                    "create_all 不会给已有表补列/改列，为避免静默造出与迁移路径分叉的 schema，"
+                    "已跳过。" + _ALEMBIC_ADOPT_HINT
+                )
+            else:  # revision_count is None：连 alembic_version 表都没有
+                logger.warning(
+                    "数据库非空，但没有 alembic_version 表 —— 该库不是迁移建库。"
+                    "create_all 不会给已有表补列/改列，为避免静默造出与迁移路径分叉的 schema，"
+                    "已跳过。" + _ALEMBIC_ADOPT_HINT
                 )
             return
 
