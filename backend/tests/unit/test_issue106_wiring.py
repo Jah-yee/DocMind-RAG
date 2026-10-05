@@ -8,7 +8,6 @@ from unittest.mock import MagicMock
 
 import pytest
 
-
 # ── #106 §2.6：requires_auth 此前只 logger.debug，从不阻断 ────────────────
 
 class TestRequiresAuthEnforced:
