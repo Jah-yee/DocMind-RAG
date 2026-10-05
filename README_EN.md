@@ -167,7 +167,7 @@ Query enters
 | Messaging | `kafka_client.py` | aiokafka producer |
 | Auth | `security.py` | JWT + bcrypt, get_current_user dependency, RBAC helpers |
 | Middleware | `middleware.py` | Metrics collection (request count/latency/errors) |
-| Circuit Breaker | `circuit_breaker.py` | External service call circuit breaker |
+| Circuit Breaker | `circuit_breaker.py` | Circuit breaker pattern — **not wired into the production path** (swallows exceptions and returns degraded values on open/failure, which would defeat the executor's error classification; see module docstring) |
 | Step Runner | `step_runner.py` | Safe step execution with retry/fallback |
 | Tracing | `tracing.py` | OpenTelemetry OTLP gRPC export |
 | Trace Logger | `trace_logger.py` | Agent execution tracing to JSONL |
