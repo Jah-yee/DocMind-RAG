@@ -49,7 +49,8 @@ class OrganizationService:
                 stmt = select(Organization).options(selectinload(Organization.children)).order_by(Organization.level, Organization.sort_order)
             else:
                 # 普通用户只能看到自己所在组织及其下属（简化处理：看到所有非私有组织）
-                stmt = select(Organization).where(not Organization.is_private).options(selectinload(Organization.children)).order_by(Organization.level, Organization.sort_order)
+                # 不能用 `not`：SQLAlchemy 列描述符的 __bool__ 恒为 True，会坍缩成 WHERE false（issue #95）
+                stmt = select(Organization).where(Organization.is_private.is_(False)).options(selectinload(Organization.children)).order_by(Organization.level, Organization.sort_order)
 
             result = await db.execute(stmt)
             all_orgs = result.scalars().all()
