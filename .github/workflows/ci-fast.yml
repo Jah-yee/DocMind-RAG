@@ -87,8 +87,11 @@ jobs:
           alembic upgrade head
           python scripts/check_schema.py
 
-      # 覆盖率只在 3.12 腿启用（见 matrix.include）：3.11 腿不带 --cov，
-      # pyproject.toml 的 fail_under 门禁因此在它上面不会触发（不采集就不判定）。
+      # 覆盖率只在 3.12 腿启用（见 matrix.include）：3.11 腿不带 --cov，自然不做覆盖率判定。
+      #
+      # 覆盖率下限**写在这条命令上而不是 pyproject.toml 里**：下限是"针对某个测试子集"的
+      # 判断，不是仓库的全局属性。integration job 只跑 tests/integration/（约 32%），
+      # 套用同一个 42% 会把一次 179 个测试全过的运行报成失败 —— 这已经真实发生过。
       - name: Run fast tests (unit + behavior + API security regressions)
         working-directory: backend
         env:
@@ -99,7 +102,7 @@ jobs:
           # 整串当成单个参数、pytest 找不到路径。数组是唯一同时满足两者的写法。
           ARGS=(tests/unit/ tests/behavior/ tests/integration/test_security_regressions.py tests/integration/test_api_auth.py -v --tb=short)
           if [ "$COVERAGE" = "true" ]; then
-            python -m pytest "${ARGS[@]}" --cov=app --cov-report=xml --cov-report=term
+            python -m pytest "${ARGS[@]}" --cov=app --cov-report=xml --cov-report=term --cov-fail-under=42
           else
             python -m pytest "${ARGS[@]}"
           fi
