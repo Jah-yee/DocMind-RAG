@@ -4,19 +4,24 @@ CI 的 schema 门禁用它在真实数据库上做断言：
   1. ``alembic_version`` 的内容与迁移脚本的 head **集合相等**（不多、不少、不分叉）；
   2. 所有 revision id <= 32 字符（MySQL 的 version_num 是 VARCHAR(32)，超长报 1406）；
   3. 迁移建出来的表与 ``Base.metadata`` 声明的表完全一致；
-  4. MySQL 上所有表使用统一的 canonical collation。
+  4. MySQL 上每一列的 ``COLUMN_TYPE / IS_NULLABLE / COLUMN_DEFAULT / EXTRA``
+     与模型声明一致（issue #150：此前只查表/列存在性，默认值/可空性/枚举漂移
+     在漂移库上照样打印「校验通过」）；
+  5. MySQL 上所有表使用统一的 canonical collation。
 
 用法::
 
     python scripts/check_schema.py                  # Alembic 路径：含 revision 校验
     python scripts/check_schema.py --create-all     # create_all 路径：跳过 revision 校验
-    python scripts/check_schema.py --report-columns # 额外打印列级漂移报告（不阻断）
+    python scripts/check_schema.py --report-columns # 额外打印列级漂移报告（不阻断；
+                                                    # 列级门禁已由第 4 项承担）
 
 退出码 0 = 通过，1 = 失败。数据库地址取 ``DATABASE_URL``（与 alembic 同源）。
 """
 from __future__ import annotations
 
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -25,7 +30,8 @@ sys.path.insert(0, str(BACKEND_DIR))
 
 from alembic.config import Config  # noqa: E402
 from alembic.script import ScriptDirectory  # noqa: E402
-from sqlalchemy import create_engine, inspect, text  # noqa: E402
+from sqlalchemy import Integer, create_engine, inspect, text  # noqa: E402
+from sqlalchemy.sql import elements as sa_elements  # noqa: E402
 
 import app.models  # noqa: E402, F401  # 必须导入以填充 Base.metadata
 from app.core.config import settings  # noqa: E402
@@ -117,6 +123,151 @@ def check_tables_match(engine) -> list[str]:
     return errors
 
 
+# ── 列级定义比对（issue #150）──────────────────────────────────────────────
+# 只对 MySQL 生效：走 information_schema，并把模型声明渲染成 MySQL 方言的
+# 期望形态。两者各自归一化后逐字段比较（见下面每个 _normalize_* 的说明）。
+
+def _normalize_mysql_type(ddl_type: str) -> str:
+    """归一化列类型文本，只做「同义类型名」的折叠，不折叠值本身。
+
+    - 关键字大小写：SQLAlchemy 渲染 ``VARCHAR(36)``，information_schema 给
+      ``varchar(36)`` —— 类型关键字大小写不敏感，统一小写。
+    - 同义名：``INTEGER`` ≡ ``int``；``BOOL``/``BOOLEAN`` ≡ ``tinyint(1)``。
+    - 枚举类型**不折叠值的大小写**（enum('A') 与 enum('a') 是不同 schema，
+      这正是 issue #150 类4 要抓的漂移），只把函数名 ``ENUM`` 归一成 ``enum``。
+    """
+    t = ddl_type.strip()
+    if "'" in t:
+        m = re.match(r"^([A-Za-z]+)(\(.*\))$", t)
+        return m.group(1).lower() + m.group(2) if m else t
+    low = t.lower()
+    if low == "integer":
+        return "int"
+    if low in ("bool", "boolean"):
+        return "tinyint(1)"
+    return low
+
+
+def _normalize_default(default: str | None) -> str | None:
+    """归一化默认值文本。
+
+    MySQL 8 对 ``DEFAULT CURRENT_TIMESTAMP`` 与表达式默认 ``DEFAULT (now())``
+    在 COLUMN_DEFAULT 的回显不同（'CURRENT_TIMESTAMP' vs 'now()'），二者对
+    DATETIME 列语义一致（插入时取当前时间），此处折叠为 'now()'。
+    其余默认值去掉最外层括号后原样保留（保留引号，例如 '0' 与 0 不折叠）。
+    """
+    if default is None:
+        return None
+    s = default.strip()
+    if len(s) >= 2 and s.startswith("(") and s.endswith(")"):
+        s = s[1:-1].strip()
+    if s.lower() in ("current_timestamp", "now()"):
+        return "now()"
+    return s
+
+
+def _is_expression_default(arg) -> bool:
+    """MySQL 对表达式默认值在 EXTRA 里标 DEFAULT_GENERATED，字面量不标。"""
+    if isinstance(arg, sa_elements.TextClause):
+        text_ = arg.text.strip().lower()
+        return "(" in text_ or text_ == "current_timestamp"
+    return not isinstance(arg, str)  # Function / 其它 ClauseElement 视为表达式
+
+
+def _expected_column_spec(column, table, dialect):
+    """把模型列声明渲染成归一化后的 (type, is_nullable, default, extra)。"""
+    expected_type = _normalize_mysql_type(column.type.compile(dialect=dialect))
+    expected_nullable = "NO" if not column.nullable else "YES"
+
+    default = None
+    extra = ""
+    if column.server_default is not None:
+        arg = column.server_default.arg
+        if isinstance(arg, str):
+            default = arg
+        elif isinstance(arg, sa_elements.TextClause):
+            default = arg.text
+        else:
+            default = str(arg.compile(dialect=dialect, compile_kwargs={"literal_binds": True}))
+        default = _normalize_default(default)
+        if _is_expression_default(arg):
+            extra = "DEFAULT_GENERATED"
+
+    is_int_pk = (
+        column.primary_key
+        and isinstance(column.type, Integer)
+        and len(table.primary_key.columns) == 1
+        and (column.autoincrement is True or column.autoincrement == "auto")
+    )
+    if is_int_pk:
+        extra = (extra + " auto_increment").strip()
+
+    return expected_type, expected_nullable, default, extra
+
+
+def check_column_definitions(engine) -> list[str]:
+    """逐列对比 COLUMN_TYPE / IS_NULLABLE / COLUMN_DEFAULT / EXTRA 与模型声明。
+
+    非 MySQL 方言跳过（information_schema 与类型渲染都是 MySQL 特有；
+    SQLite 的冒烟路径由表级检查覆盖）。返回错误信息列表，每条点名
+    「表.列：期望什么、实际什么」。
+    """
+    if engine.dialect.name != "mysql":
+        return []
+
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text(
+                "SELECT table_name, column_name, column_type, is_nullable, "
+                "column_default, extra FROM information_schema.columns "
+                "WHERE table_schema = DATABASE()"
+            )
+        ).all()
+
+    actual: dict[tuple[str, str], tuple] = {}
+    for table, column, ctype, nullable, default, extra in rows:
+        if table == ALEMBIC_VERSION_TABLE:
+            continue
+        actual[(table, column)] = (
+            _normalize_mysql_type(ctype),
+            nullable,
+            _normalize_default(default),
+            (extra or "").strip(),
+        )
+
+    errors: list[str] = []
+    for table_name, table in sorted(Base.metadata.tables.items()):
+        if not any(k[0] == table_name for k in actual):
+            continue  # 表缺失由 check_tables_match 报告
+        for column in table.columns:
+            key = (table_name, column.name)
+            if key not in actual:
+                errors.append(f"{table_name}.{column.name}: 模型有但库里没有这一列")
+                continue
+            expected = _expected_column_spec(column, table, engine.dialect)
+            got = actual[key]
+            if expected != got:
+                fields = ("类型", "可空", "默认值", "EXTRA")
+                delta = "，".join(
+                    f"{f}: 期望={x!r} 实际={y!r}"
+                    for f, x, y in zip(fields, expected, got, strict=True)
+                    if x != y
+                )
+                errors.append(f"{table_name}.{column.name}: {delta}")
+        model_columns = {c.name for c in table.columns}
+        for (t, c) in sorted(actual):
+            if t == table_name and c not in model_columns:
+                errors.append(f"{t}.{c}: 库里有但模型没有这一列")
+
+    if errors:
+        errors.insert(
+            0,
+            f"列定义与模型声明不一致（{len(errors)} 处）；"
+            "这是 issue #150 修复的漂移类别（默认值/可空性/枚举/类型）",
+        )
+    return errors
+
+
 def check_collation(engine) -> list[str]:
     """MySQL 上：所有业务表必须使用统一的 canonical collation。
 
@@ -187,7 +338,11 @@ def main() -> int:
 
     engine = create_engine(_sync_url(url), pool_pre_ping=True)
     try:
-        errors = check_tables_match(engine) + check_collation(engine)
+        errors = (
+            check_tables_match(engine)
+            + check_column_definitions(engine)
+            + check_collation(engine)
+        )
         if not create_all_mode:
             errors = check_alembic_revision(engine) + errors
         tables = inspect(engine).get_table_names()
