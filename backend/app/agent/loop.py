@@ -357,7 +357,7 @@ class PERAgentLoop:
                 step_results = self.memory.get_all_results()
                 qg_result = quality_gate_check(step_results)
                 # §5b：质检结论落成结构化状态（每轮覆盖，防止 replan 后残留
-                # 上一轮的失败标记）。run report 与 execution_context 事件读它。
+                # 上一轮的失败标记）。run report 直接读它；SSE 侧另经 decision 携带。
                 ctx.artifacts["quality_gate"] = {
                     "passed": qg_result["passed"],
                     "fatal_issues": list(qg_result.get("fatal_issues", [])),
@@ -497,7 +497,7 @@ class PERAgentLoop:
                 recommendation = "revise"
             else:
                 recommendation = "pass"
-            # 结构化记录：run report 与 execution_context 事件读取。
+            # 结构化记录：run report 读取；SSE 侧另经 decision 携带。
             ctx.artifacts["review"] = {
                 "recommendation": recommendation,
                 "issue_count": len(issues),
