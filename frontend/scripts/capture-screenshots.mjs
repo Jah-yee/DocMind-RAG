@@ -108,8 +108,19 @@ async function main() {
     for (const shot of shots) {
       await page.goto(BASE_URL, { waitUntil: 'domcontentloaded' }).catch(() => {})
       await page.evaluate((t) => {
-        if (t) localStorage.setItem('docmind_token', 'screenshot-token')
-        else localStorage.removeItem('docmind_token')
+        if (t) {
+          localStorage.setItem('docmind_token', 'screenshot-token')
+          // 必须同时种过期时间：路由守卫有 `if (token && isTokenExpired())` 分支，
+          // 而 isTokenExpired() 在**缺少过期条目时返回 true** → token 会被直接清掉、
+          // 页面被踢回登录页。此前只种 token 不种过期时间，导致三张截图全是登录页。
+          localStorage.setItem(
+            'docmind_token_expires',
+            String(Date.now() + 3600 * 1000),
+          )
+        } else {
+          localStorage.removeItem('docmind_token')
+          localStorage.removeItem('docmind_token_expires')
+        }
       }, shot.auth)
       await stubAuth(page)
       await page.goto(`${BASE_URL}${shot.path}`, { waitUntil: 'networkidle', timeout: 30_000 }).catch(() => {})
