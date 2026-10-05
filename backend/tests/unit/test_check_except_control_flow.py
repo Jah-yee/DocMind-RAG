@@ -217,3 +217,27 @@ def test_script_exits_2_on_empty_tree(tmp_path):
 
     assert proc.returncode == 2, proc.stdout + proc.stderr
     assert "未扫描到任何 .py 文件" in proc.stderr
+
+
+def test_non_utf8_file_exits_2(tmp_path):
+    """非 UTF-8 文件属工具失败：必须 exit 2 且明确报「工具失败」，不得裸崩成 exit 1（评审 Minor-5）。"""
+    target = tmp_path / "app" / "api" / "v1" / "endpoints"
+    target.mkdir(parents=True, exist_ok=True)
+    (target / "latin.py").write_bytes(b'x = "\xe9\xff"\n')
+
+    proc = _run_script(tmp_path)
+
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert "工具失败" in proc.stderr
+
+
+def test_bom_file_is_not_misdetected(tmp_path):
+    """带 BOM 的文件是合法 Python（评审 Minor-4）：干净文件必须 exit 0（不得误报语法错误），违规仍照常检出。"""
+    clean_root = _make_tree(tmp_path / "clean", "\ufeff" + RELEASED_SOURCE, name="ok.py")
+    proc = _run_script(clean_root)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "检查通过" in proc.stdout
+
+    bad_root = _make_tree(tmp_path / "bad", "\ufeff" + VIOLATION_SOURCE, name="bad.py")
+    proc = _run_script(bad_root)
+    assert proc.returncode == 1, proc.stdout + proc.stderr

@@ -43,8 +43,9 @@ except 会把它捕获并重新包装（或吞成错误字典），于是 4xx �
 判定只按**类名**、不解析真实继承关系：与内建 / 框架同名的本地自定义异常也
 会命中，属于有意的保守误报（宁可多报，不可漏报）。
 
-退出码：0 = 无违规；1 = 发现违规；2 = 扫描出错（读文件失败 / 语法错误 /
-未扫描到任何 .py 文件 —— 门禁不允许空转成假绿）。
+退出码：0 = 无违规；1 = 发现违规；2 = 扫描出错 —— 工具失败（读文件失败 /
+非 UTF-8 解码失败 / 语法错误 / 未扫描到任何 .py 文件），**刻意与「发现违规」
+的 1 区分**，避免工具故障被误读成一次真实的门禁红灯，反之亦然。
 """
 
 from __future__ import annotations
@@ -258,9 +259,13 @@ def main(argv: list[str] | None = None) -> int:
         scanned += 1
         relative = path.relative_to(root).as_posix()
         try:
-            source = path.read_text(encoding="utf-8")
-        except OSError as exc:
-            print(f"{relative}: 读取失败: {exc}", file=sys.stderr)
+            # utf-8-sig：带 BOM 的 .py 是合法 Python（CPython 接受 BOM）。用 utf-8
+            # 读会把 BOM（U+FEFF）留在源码里，ast.parse 会误报「语法错误」（issue #98 评审 Minor-4）。
+            source = path.read_text(encoding="utf-8-sig")
+        except (OSError, UnicodeDecodeError) as exc:
+            # 工具失败（含非 UTF-8 编码）必须走 exit 2：与「发现违规」的 exit 1 同码
+            # 会把工具故障误读成真实门禁红灯（issue #98 评审 Minor-5）。
+            print(f"{relative}: 工具失败：无法以 UTF-8 读取（{exc}）", file=sys.stderr)
             return 2
         try:
             violations.extend(find_violations(source, relative))
