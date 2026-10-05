@@ -2,6 +2,21 @@
 企业级熔断器 - 防止系统雪崩，提供优雅降级方案
 小白解释：就像家里的保险丝，如果某个外部服务（比如 AI 接口）一直报错，
 保险丝就会断开，直接返回预设好的“友好提示”，而不是让整个系统卡死在那。
+
+当前接线状态（issue #106 §4c，2026-10 核实）：**本模块未接入生产路径**。
+    - 此前定义的三个模块级实例（AI-DeepSeek / Database / Elasticsearch）在仓库内
+      零引用，已删除 —— 留着它们会诱导把关键调用接成一个「失败时静默返回降级值」
+      的陷阱。
+    - 不接线的理由：本实现在失败/熔断时**吞掉异常**，返回按函数返回注解推导的降级值
+      （list→[]、dict→{...}、str→提示语、无注解→None）。调用方无法区分「成功返回了
+      空结果」与「服务已熔断/失败」；而 Agent 执行器的错误分类与重试
+      （executor.py `_execute_step_with_retry`，依据 tool_error 事件上的 error_type
+      查 retry_policy）依赖异常被分类后上浮 —— 接上会让失败变成静默降级。
+      Agent 执行侧同类保护由 Executor 自身的连续失败熔断（MAX_CONSECUTIVE_FAILURES）
+      与 StepRunner 硬超时承担。证据见 _orchestrate/cc_report_ws106a.md。
+    - 未来若要接入：先让熔断可区分 —— OPEN 时抛出一个可分类的异常（或提供显式的
+      degraded 标记），并同步修改 tests/unit/test_circuit_breaker.py 中锁定的
+      「降级返回值」契约。
 """
 
 import asyncio
@@ -113,8 +128,3 @@ class CircuitBreaker:
             return "服务暂时繁忙，请稍后再试。"
 
         return None
-
-# 定义常用的熔断器实例
-ai_service_breaker = CircuitBreaker(name="AI-DeepSeek", failure_threshold=3, recovery_timeout=60)
-db_service_breaker = CircuitBreaker(name="Database", failure_threshold=10, recovery_timeout=30)
-es_service_breaker = CircuitBreaker(name="Elasticsearch", failure_threshold=5, recovery_timeout=45)
