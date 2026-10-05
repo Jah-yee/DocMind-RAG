@@ -1,0 +1,29 @@
+name: Dependency Review
+
+# 职责边界（与其它工具不重叠）：
+#   Dependency Review = 这个 PR 有没有把新的危险依赖带进来（只审查**变化**）
+#   Dependabot        = 当前依赖树里已有哪些已知漏洞（基线监控）
+#   Bandit / CodeQL   = 代码层面的静态分析
+on:
+  pull_request:
+    branches: [main, develop]
+
+permissions:
+  contents: read        # 只读即可：不往 PR 写评论，结果由 job summary 表达
+
+jobs:
+  dependency-review:
+    name: Dependency Review
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - name: Review dependency changes
+        uses: actions/dependency-review-action@v5
+        with:
+          # 只阻断 high 及以上：单人项目不该因为一个 low 级 advisory 就卡住 PR。
+          # 较低等级交由 Dependabot 持续跟踪。
+          fail-on-severity: high
+          # 不启 license 检查：仓库目前没有明确的许可证策略，
+          # 没有规则的门禁只是"看起来专业"的噪音。
+          license-check: false
