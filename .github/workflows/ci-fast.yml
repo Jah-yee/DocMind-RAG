@@ -350,6 +350,53 @@ jobs:
         working-directory: frontend
         run: npm run build
 
+      # E2E 冒烟不放在本 job 里：它会给 frontend-tests 增加约 100 秒，
+      # 使其超过 Backend Tests 成为新的关键路径、把 PR 墙钟从约 133 秒推到约 180 秒。
+      # 改为独立的并行 job（见下方 frontend-e2e），墙钟不变。
+
+  # E2E 冒烟：纯前端 + page.route 打桩，**不需要后端/数据库服务**。
+  # 独立成 job 是为保住快速门禁的墙钟 —— 与前端单测并行跑。
+  frontend-e2e:
+    name: Frontend E2E Smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci
+
+      # 与 screenshots.yml 共用同一个缓存 key，命中即约 5 秒
+      - name: Cache Playwright browsers
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ hashFiles('frontend/package-lock.json') }}
+
+      - name: Install Playwright chromium
+        working-directory: frontend
+        run: npx playwright install --with-deps chromium
+
+      - name: E2E smoke tests
+        working-directory: frontend
+        run: npx playwright test
+
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-failure-artifacts
+          path: |
+            frontend/test-results/
+          retention-days: 7
+
   # 校验 workflow 文件本身：表达式、needs 引用、shellcheck run 块
   workflow-lint:
     name: Workflow Lint
@@ -374,7 +421,7 @@ jobs:
   ci-pass:
     name: CI Pass
     if: always()
-    needs: [backend-tests, migration-mysql, frontend-tests, workflow-lint]
+    needs: [backend-tests, migration-mysql, frontend-tests, frontend-e2e, workflow-lint]
     runs-on: ubuntu-latest
     steps:
       - name: Check all jobs
@@ -384,6 +431,7 @@ jobs:
             "backend-tests=${{ needs.backend-tests.result }}" \
             "migration-mysql=${{ needs.migration-mysql.result }}" \
             "frontend-tests=${{ needs.frontend-tests.result }}" \
+            "frontend-e2e=${{ needs.frontend-e2e.result }}" \
             "workflow-lint=${{ needs.workflow-lint.result }}"; do
             name="${r%%=*}"; result="${r#*=}"
             if [ "$result" != "success" ]; then echo "::error::$name -> $result"; failed=1; fi
