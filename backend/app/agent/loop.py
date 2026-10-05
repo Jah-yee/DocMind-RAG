@@ -405,6 +405,17 @@ class PERAgentLoop:
                     sum(1 for g, _ in qg_result["grades"].values() if g == "F"),
                 )
 
+            # ── Phase 2c: Experience write-back（经验回路的写入侧）───────────
+            # 此前这个回路是**断的**：planner 读经验（format_for_planner），但 runtime
+            # 从不写 ExperienceStore —— 只有离线的 benchmark 批量抽取（run_extract.py）
+            # 会写。结果是「读一个永远不会增长的经验库」。
+            #
+            # 写入失败绝不能影响用户请求：整段包在 try 里，只记 warning。
+            try:
+                await self._write_experiences(ctx, plan, qg_result)
+            except Exception as e:
+                logger.warning("Experience write-back failed: %s", e)
+
         # ── Phase 3: Reflection ──────────────────────────────────────────
         if self.config.enable_reflection and plan.steps:
             results = self.memory.get_all_results()
@@ -529,6 +540,47 @@ class PERAgentLoop:
             ):
                 yield retry_event
             return
+
+    async def _write_experiences(self, ctx: Any, plan: Plan, qg_result: dict | None) -> None:
+        """经验回路的写入侧：把本次执行的成败转成经验落库。
+
+        为什么放在质检之后而不是执行器里：正向经验需要「这次执行有多好」这个信号，
+        而唯一的质量判据是质检的等级。放在执行器里只能拿到"步骤成功/失败"，分不出
+        "成功但平庸"和"成功且优秀"——而把平庸路径记成"有效模式"会污染后续规划
+        （这些经验会被注入 planner 的 system prompt）。
+        """
+        from app.agent.experience import get_experience_store
+        from app.agent.experience.extractor import (
+            extract_from_runtime_error,
+            extract_from_runtime_success,
+        )
+
+        store = get_experience_store()
+        query = ctx.query or plan.goal
+
+        # 失败 → 错误经验。extractor 内部按错误特征匹配，匹配不上就返回 None。
+        for step in plan.steps:
+            if step.status != "failed":
+                continue
+            error = str(step.error_context or "unknown error")
+            exp = await extract_from_runtime_error(error, query=query)
+            if exp:
+                await store.add(exp)
+                logger.info("Experience recorded (failure): %s", exp.short_summary())
+
+        # 成功 → 正向经验。只在质检**全 A** 时记：门槛刻意设高，宁可少记。
+        grades = (qg_result or {}).get("grades") or {}
+        tools = [s.tool_hint for s in plan.steps if s.tool_hint]
+        if grades and tools and all(g == "A" for g, _ in grades.values()):
+            exp = await extract_from_runtime_success(
+                query=query,
+                category=getattr(plan, "category", "") or "general",
+                tool_sequence=tools,
+                result_quality=1.0,
+            )
+            if exp:
+                await store.add(exp)
+                logger.info("Experience recorded (success): %s", exp.short_summary())
 
     def _build_messages(
         self,

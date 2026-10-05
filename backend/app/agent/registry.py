@@ -299,7 +299,7 @@ class ToolRegistry:
         self._max_log_entries = 5000
 
         # Register built-in hooks
-        self._pre_hooks.append(self._builtin_auth_logging_hook)
+        self._pre_hooks.append(self._builtin_auth_hook)
         self._post_hooks.append(self._builtin_logging_hook)
         self._post_hooks.append(self._builtin_error_mapper_hook)
 
@@ -639,10 +639,32 @@ class ToolRegistry:
         if len(self._log) > self._max_log_entries:
             self._log.pop()
 
-    async def _builtin_auth_logging_hook(self, ctx: HookContext) -> None:
-        """Pre-hook that logs auth info for requires_auth tools."""
-        if ctx.entry.requires_auth and ctx.entry.auth_handler:
-            logger.debug("Tool '%s' requires auth via '%s'", ctx.tool_name, ctx.entry.auth_handler)
+    async def _builtin_auth_hook(self, ctx: HookContext) -> None:
+        """Pre-hook enforcing `requires_auth`（此前只 logger.debug，从不阻断）。
+
+        **语义边界** —— 这个字段此前把两件事混在一起，所以一直不敢拦：
+
+          · `requires_auth=True`  → 需要**已认证的调用者**，即调用方必须带上组织
+            身份。当前标了它的三个工具（list_documents / list_conversations /
+            get_conversation_history）都是这个含义 —— 它们不需要外部凭据，
+            需要的是「你是谁、你属于哪个组织」。
+          · `auth_handler="xxx"`  → 需要**外部凭据**（如飞书的 tenant token）。
+            凭据的获取与刷新由工具自身负责，注册表只检查它是否声明了。
+
+        本 hook 只强制前者。**fail-closed**：声明了 requires_auth 却没有可用的
+        调用者身份时拒绝执行 —— 让工具带着空组织上下文跑进去，只会在更深处抛一个
+        含糊的异常，或者更糟：查到不属于调用者的数据。
+        """
+        if not ctx.entry.requires_auth:
+            return
+        if ctx.extra.get("organization_id") is None:
+            raise ToolAbortError(
+                code="auth_required",
+                message=(
+                    f"工具 '{ctx.tool_name}' 声明了 requires_auth，但调用方未提供"
+                    f"组织上下文（organization_id）—— 拒绝执行"
+                ),
+            )
 
     async def _builtin_error_mapper_hook(self, result: ToolResult, ctx: HookContext) -> None:
         """Post-hook: map raw exception types to 23 standardised ToolErrorType codes.

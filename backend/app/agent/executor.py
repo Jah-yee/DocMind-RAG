@@ -706,7 +706,12 @@ class Executor:
                     )
                     tool_results.append({"tool": func.name, "result": result})
                     if ctx:
-                        ctx.add_finding(step.id, result[:200], func.name)
+                        # 显式传 confidence：Finding.confidence 有消费方
+                        # （ExecutionContext.to_dict() 会把它序列化进运行记录），
+                        # 而此前从不传值 → 永远是默认的 "medium"，与"这是工具直接
+                        # 取回的事实"这一性质不符。工具结果按定义是外部事实，
+                        # 记 high；由 LLM 推导出的结论才该是 medium。
+                        ctx.add_finding(step.id, result[:200], func.name, confidence="high")
 
             except Exception as e:
                 elapsed = (time.perf_counter() - start) * 1000
