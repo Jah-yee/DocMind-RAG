@@ -7,7 +7,7 @@ import { computed, onMounted, nextTick, watch } from 'vue'
 import MarkdownIt from 'markdown-it'
 import hljs from 'highlight.js/lib/common'
 import DOMPurify from 'dompurify'
-import mdKatex from 'markdown-it-katex'
+import mdKatex from '@vscode/markdown-it-katex'
 import 'highlight.js/styles/github-dark.css'
 import 'katex/dist/katex.min.css'
 
@@ -17,7 +17,10 @@ interface Props {
 
 const props = defineProps<Props>()
 
-const md: MarkdownIt = new MarkdownIt({
+// markdown-it 15 起，默认导出是 `MarkdownItCallable`（一个 const，兼容不带 new 的旧写法），
+// 它只有「值」没有「类型」含义 —— 因此不能再拿默认导入当类型标注。
+// 这里去掉显式标注，让 TS 从 `new` 的构造签名推断出 MarkdownIt 实例类型。
+const md = new MarkdownIt({
   html: false,
   linkify: true,
   typographer: true,
