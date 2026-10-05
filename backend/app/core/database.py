@@ -64,10 +64,37 @@ async def _warn_if_collation_differs() -> None:
         logger.debug(f"collation 检查跳过: {str(e)}")
 
 
-async def init_db():
-    """初始化数据库 — 开发模式使用 create_all，生产模式应使用 Alembic。
+async def _database_state(conn) -> tuple[int, bool]:
+    """返回 (库里的表数量, 是否存在 alembic_version 表)，兼容 MySQL 与 SQLite。"""
+    if conn.dialect.name == "mysql":
+        table_count = (await conn.execute(text(
+            "SELECT COUNT(*) FROM information_schema.tables "
+            "WHERE table_schema = DATABASE()"
+        ))).scalar() or 0
+        has_alembic_version = bool((await conn.execute(text(
+            "SELECT COUNT(*) FROM information_schema.tables "
+            "WHERE table_schema = DATABASE() AND table_name = 'alembic_version'"
+        ))).scalar())
+    else:
+        table_count = (await conn.execute(text(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'"
+        ))).scalar() or 0
+        has_alembic_version = bool((await conn.execute(text(
+            "SELECT COUNT(*) FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'alembic_version'"
+        ))).scalar())
+    return int(table_count), has_alembic_version
 
-    设置 ``USE_ALEMBIC=true`` 环境变量可跳过 create_all，由 Alembic 管理 schema。
+
+async def init_db():
+    """初始化数据库 — create_all 只用于**空库引导**，schema 的长期管理走 Alembic。
+
+    设置 ``USE_ALEMBIC=true`` 环境变量可完全跳过 create_all。
+
+    自 issue #150 起，create_all 仅在空库上执行：它不会给已有表补列，在非空库上
+    运行只会在缺表时静默造出与迁移路径口径不同的表——这正是 issue #150 schema
+    漂移的「另一半」来源。非空库会被跳过：有 alembic_version 说明 schema 归迁移
+    管；没有则打一条漂移告警（该库不是迁移建库）。
     """
     try:
         import os
@@ -77,6 +104,20 @@ async def init_db():
 
         if use_alembic:
             logger.info("数据库 schema 由 Alembic 管理，跳过 create_all")
+            return
+
+        async with engine.connect() as conn:
+            table_count, has_alembic_version = await _database_state(conn)
+
+        if table_count > 0:
+            if has_alembic_version:
+                logger.info("数据库非空且存在 alembic_version，schema 由迁移管理，跳过 create_all")
+            else:
+                logger.warning(
+                    "数据库非空但没有 alembic_version —— 不是迁移建库。create_all 不会给已有表"
+                    "补列/改列，为避免静默造出与迁移路径分叉的 schema，已跳过。建议运行"
+                    " python scripts/check_schema.py 核对漂移，并改用 Alembic 接管 schema。"
+                )
             return
 
         logger.info("正在初始化数据库 (create_all)...")
