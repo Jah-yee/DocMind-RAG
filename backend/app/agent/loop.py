@@ -69,9 +69,7 @@ def _smart_truncate(result: str, tool_name: str) -> str:
     if tool_name in ("search_knowledge_base", "vector_search", "web_search"):
         sections = result.split("\n\n")
         if len(sections) > 3:
-            return (
-                "\n\n".join(sections[:3]) + f"\n\n... and {len(sections) - 3} more results omitted"
-            )
+            return "\n\n".join(sections[:3]) + f"\n\n... and {len(sections) - 3} more results omitted"
         return result
 
     if tool_name in ("summarize_document", "get_conversation_history", "fetch_webpage"):
@@ -79,7 +77,7 @@ def _smart_truncate(result: str, tool_name: str) -> str:
         tail = result[-500:]
         return f"{head}\n\n... [middle omitted] ...\n\n{tail}"
 
-    return result[: MAX_RESULT_TOKENS * 2] + "\n...[result truncated]"
+    return result[:MAX_RESULT_TOKENS * 2] + "\n...[result truncated]"
 
 
 DEFAULT_SYSTEM_PROMPT = """你是 DocMind 智能助手，一个基于企业知识库的 AI Agent。
@@ -167,9 +165,7 @@ class PERAgentLoop:
     @property
     def executor(self) -> Executor:
         if self._executor is None:
-            self._executor = Executor(
-                self.client, self.config, self.memory, execution_mode=self._execution_mode
-            )
+            self._executor = Executor(self.client, self.config, self.memory, execution_mode=self._execution_mode)
         return self._executor
 
     @property
@@ -207,18 +203,10 @@ class PERAgentLoop:
 
         # If the output contains SQL results or search results with clear answers,
         # and remaining steps don't add new tools, we can skip
-        has_data = any(
-            marker in final_output
-            for marker in [
-                '"rows":',
-                '"data":',
-                "找到",
-                "根据",
-                "综上所述",
-                "结论",
-                "建议",
-            ]
-        )
+        has_data = any(marker in final_output for marker in [
+            '"rows":', '"data":', "找到", "根据",
+            "综上所述", "结论", "建议",
+        ])
 
         # If we have substantial output AND the next steps are just more of the same
         # (no new tool types), skip to avoid redundancy
@@ -302,7 +290,7 @@ class PERAgentLoop:
                 yield event
             plan = plan_sink[0]
 
-            # ── Phase 2: Execution ───────────────────────────────────────
+            # ── Phase 2: Execution ───────────────────────────────────────────
             pass_output = ""
 
             if self.config.enable_tools:
@@ -328,9 +316,7 @@ class PERAgentLoop:
                     # consumer stops early (client disconnect), and it reads everything
                     # the executor produced rather than only the bare "chunk" events.
                     remaining_steps = [s for s in plan.steps if s.status == "pending"]
-                    if remaining_steps and not self._should_continue_execution(
-                        execution_output, plan, remaining_steps
-                    ):
+                    if remaining_steps and not self._should_continue_execution(execution_output, plan, remaining_steps):
                         skipped = [s for s in remaining_steps if s.status == "pending"]
                         for s in skipped:
                             s.status = "skipped"
@@ -342,10 +328,7 @@ class PERAgentLoop:
                                 plan_id=plan.id,
                                 plan_progress=plan.progress,
                             )
-                            logger.info(
-                                "Conditional routing: %d steps skipped (sufficient info)",
-                                len(skipped),
-                            )
+                            logger.info("Conditional routing: %d steps skipped (sufficient info)", len(skipped))
             else:
                 # Tool-less mode: single LLM call
                 messages = self._build_messages(query, history, context_docs, memory_context)
@@ -371,7 +354,6 @@ class PERAgentLoop:
             # ── Phase 2b: Quality Gate ────────────────────────────────────────
             if plan.steps:
                 from app.agent.quality_gate import quality_gate_check
-
                 step_results = self.memory.get_all_results()
                 qg_result = quality_gate_check(step_results)
                 # §5b：质检结论落成结构化状态（每轮覆盖，防止 replan 后残留
@@ -404,8 +386,7 @@ class PERAgentLoop:
                             content=warnings[:500],
                             thinking_type="evaluation",
                         )
-                    logger.info(
-                        "Quality gate: %d passed, %d concerns, %d failed",
+                    logger.info("Quality gate: %d passed, %d concerns, %d failed",
                         sum(1 for g, _ in qg_result["grades"].values() if g == "A"),
                         sum(1 for g, _ in qg_result["grades"].values() if g == "C"),
                         sum(1 for g, _ in qg_result["grades"].values() if g == "F"),
@@ -448,9 +429,7 @@ class PERAgentLoop:
                     if not self.config.enable_planning:
                         # 规划被禁用时 replan 无从执行，只记录原因（无副作用）。
                         ctx.record_decision(
-                            "plan",
-                            "replan_unavailable",
-                            "规划已禁用，无法重新规划",
+                            "plan", "replan_unavailable", "规划已禁用，无法重新规划",
                         )
                     elif replan_attempts >= MAX_REPLANS_PER_RUN:
                         # 有界性：达到上限后不再重新规划，按当前结果收尾。
@@ -544,9 +523,7 @@ class PERAgentLoop:
                 )
             if issues:
                 if high_issues:
-                    logger.info(
-                        "Adversarial review found %d high-severity issues", len(high_issues)
-                    )
+                    logger.info("Adversarial review found %d high-severity issues", len(high_issues))
                     for issue in high_issues:
                         final_output += (
                             f"\n\n⚠️ **审查发现**: {issue.get('description', '')}\n"
@@ -643,18 +620,16 @@ class PERAgentLoop:
                 if event.type == "plan_start":
                     plan_id = event.plan_id
                 elif event.type == "plan_step" and event.plan_step_id:
-                    plan_steps.append(
-                        PlanStep(
-                            id=event.plan_step_id,
-                            description=event.content,
-                            dependencies=event.dependencies or [],
-                            tool_hint=event.tool_hint or None,
-                            parallel_group=event.parallel_group,
-                            risk_level=event.risk_level or "low",
-                            retry_strategy=event.retry_strategy or "auto_retry",
-                            fallback_tool=event.fallback_tool,
-                        )
-                    )
+                    plan_steps.append(PlanStep(
+                        id=event.plan_step_id,
+                        description=event.content,
+                        dependencies=event.dependencies or [],
+                        tool_hint=event.tool_hint or None,
+                        parallel_group=event.parallel_group,
+                        risk_level=event.risk_level or "low",
+                        retry_strategy=event.retry_strategy or "auto_retry",
+                        fallback_tool=event.fallback_tool,
+                    ))
                 elif event.type == "plan_complete":
                     # Carry the planner's own goal; never fall back to the plan id.
                     if event.plan_goal:
@@ -706,9 +681,7 @@ class PERAgentLoop:
             if step.retry_count >= self.config.max_retries_per_step:
                 logger.warning(
                     "Reflection retry for step %s skipped: retry_count %d already at limit %d",
-                    step_id,
-                    step.retry_count,
-                    self.config.max_retries_per_step,
+                    step_id, step.retry_count, self.config.max_retries_per_step,
                 )
                 return
             step.status = "pending"
@@ -790,12 +763,10 @@ class PERAgentLoop:
             system_prompt += f"\n\n{memory_context}"
 
         if context_docs:
-            context_str = "\n\n".join(
-                [
-                    f"[{i + 1}] {doc.get('filename', 'Unknown')}:\n{doc.get('snippet', doc.get('text', ''))[:500]}"
-                    for i, doc in enumerate(context_docs[:5])
-                ]
-            )
+            context_str = "\n\n".join([
+                f"[{i + 1}] {doc.get('filename', 'Unknown')}:\n{doc.get('snippet', doc.get('text', ''))[:500]}"
+                for i, doc in enumerate(context_docs[:5])
+            ])
             system_prompt += f"\n\n## 已检索到的参考文档\n{context_str}"
 
         # Personality injection
@@ -804,9 +775,7 @@ class PERAgentLoop:
             "creative": "请给出富有洞察力的回答，可以适度发散思考。",
             "balanced": "请给出结构化、全面的回答，兼顾准确性和可读性。",
         }
-        system_prompt += (
-            f"\n\n{personality_guide.get(self.config.personality, personality_guide['balanced'])}"
-        )
+        system_prompt += f"\n\n{personality_guide.get(self.config.personality, personality_guide['balanced'])}"
 
         messages.append({"role": "system", "content": system_prompt})
 
@@ -830,12 +799,10 @@ class PERAgentLoop:
         tools = tool_registry.to_openai_tools(self.config.tool_tags)
         if self.config.disabled_tools and tools:
             tools = [
-                t
-                for t in tools
+                t for t in tools
                 if t.get("function", {}).get("name") not in self.config.disabled_tools
             ]
         return tools if tools else None
-
 
 # ── Backward compatibility alias ──
 AgentLoop = PERAgentLoop
@@ -844,5 +811,4 @@ AgentLoop = PERAgentLoop
 async def _yield_control():
     """Yield control to the event loop for SSE flushing."""
     import asyncio
-
     await asyncio.sleep(0.005)
