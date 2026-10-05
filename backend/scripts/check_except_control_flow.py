@@ -46,6 +46,10 @@ except 会把它捕获并重新包装（或吞成错误字典），于是 4xx �
 退出码：0 = 无违规；1 = 发现违规；2 = 扫描出错 —— 工具失败（读文件失败 /
 非 UTF-8 解码失败 / 语法错误 / 未扫描到任何 .py 文件），**刻意与「发现违规」
 的 1 区分**，避免工具故障被误读成一次真实的门禁红灯，反之亦然。
+
+输出编码：stdout / stderr 启动时统一 reconfigure 为 UTF-8——管道 / 重定向下
+Windows 默认用 locale 编码（中文环境 cp936），中文诊断会变乱码；测试与 CI 均按
+UTF-8 读取本工具的管道输出（issue #157）。
 """
 
 from __future__ import annotations
@@ -243,11 +247,16 @@ def main(argv: list[str] | None = None) -> int:
     args = sys.argv[1:] if argv is None else argv
     root = Path(args[0]).resolve() if args else Path(__file__).resolve().parents[1]
 
-    if hasattr(sys.stdout, "reconfigure"):  # 统一 UTF-8 输出（Windows 控制台 / 管道）
-        try:
-            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-        except (ValueError, OSError):
-            pass
+    # 统一 stdout/stderr 为 UTF-8（Windows 控制台 / 管道，issue #157）。接管道 /
+    # 重定向时 Python 默认用 locale 编码（中文 Windows 是 cp936），中文诊断会成乱码：
+    # 测试以子进程管道读取 stderr 断言「未扫描到任何 .py 文件」「工具失败」等文案即因此变红。
+    # 控制台（PEP 528）本已是 UTF-8，reconfigure 在那边是无操作，不影响人眼查看。
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except (ValueError, OSError):
+                pass
 
     violations: list[Violation] = []
     scanned = 0
