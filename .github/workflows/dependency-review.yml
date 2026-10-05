@@ -32,18 +32,16 @@ jobs:
           # 不启 license 检查：仓库目前没有明确的许可证策略，
           # 没有规则的门禁只是"看起来专业"的噪音。
           license-check: false
-          # 两个「无补丁版本」的公告：版本升级永远解决不了，故显式豁免并写明理由。
-          # 这是 allow-list 的标准用途（记录在案的例外），不是关掉门禁 ——
-          # 其它任何 high+ 的新增依赖仍会阻断（已实测，见 PR #124 的验证）。
+          # 唯一一个「无补丁版本」的公告，显式豁免并写明理由。这是 allow-list 的标准用途
+          # （记录在案的例外），不是关掉门禁 —— 其它任何 high+ 的新增依赖仍会阻断
+          # （已实测，见 PR #124 的验证）。
           #
           #   GHSA-vfj7-8cjw-p6xm  braces <= 3.0.3 —— 深度嵌套导致栈耗尽的 DoS
           #     braces 的**最新版就是 3.0.3**，官方无修复版本。它经
           #     micromatch ← fast-glob 进入 eslint 工具链，只在构建/lint 期使用，
           #     不进入运行时产物。
           #
-          #   GHSA-5ff8-jcf9-fw62  markdown-it-katex —— XSS
-          #     包已停止维护、无修复版本。但本仓库的渲染输出**先经
-          #     DOMPurify.sanitize() 再 v-html**（src/components/common/Markdown.vue:47,2），
-          #     该 XSS 已被缓解。若要彻底移除，可换用维护中的
-          #     @vscode/markdown-it-katex（尚未做，记为待办）。
-          allow-ghsas: GHSA-vfj7-8cjw-p6xm, GHSA-5ff8-jcf9-fw62
+          # 已移除的一条：GHSA-5ff8-jcf9-fw62（markdown-it-katex 的 XSS）。
+          # 该包已换成维护中的 @vscode/markdown-it-katex，漏洞从根上消失，
+          # 不再需要豁免 —— 能换包就换包，豁免只留给真正换不掉的。
+          allow-ghsas: GHSA-vfj7-8cjw-p6xm
