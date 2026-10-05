@@ -41,6 +41,11 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ['3.11', '3.12']
+        include:
+          # 只有 3.12 采集覆盖率并应用 fail_under 门禁；3.11 的职责是证明
+          # 代码在该版本上能跑，不参与覆盖率判定（避免版本间微小差异卡住 PR）。
+          - python-version: '3.12'
+            coverage: 'true'
 
     env:
       DATABASE_URL: sqlite+aiosqlite:///test.db
@@ -49,28 +54,32 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Cache pip
-        uses: actions/cache@v6
+      # 缓存改由 setup-uv 接管（原 ~/.cache/pip 缓存步骤随之移除——迁移后不再有 pip 写入）。
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
         with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ matrix.python-version }}-${{ hashFiles('backend/requirements.txt', 'backend/requirements-dev.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-${{ matrix.python-version }}-
+          enable-cache: true
+          cache-dependency-glob: 'backend/requirements*.txt'
 
+      # --system：直接装进 actions/setup-python 为矩阵选定的解释器，无需建 venv/激活。
       - name: Install dependencies
         working-directory: backend
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install -r requirements-dev.txt
+        run: uv pip install --system -r requirements.txt -r requirements-dev.txt
 
       - name: Lint with ruff
         working-directory: backend
         run: ruff check app/ tests/ scripts/
+
+      # 静态安全扫描前置到 PR：此前只在 nightly 跑，而 nightly 已连续红 ≥11 天，
+      # 等于这条门禁事实上不存在。bandit 已在 requirements-dev.txt，无需额外安装。
+      # 只阻断 medium+；low 档留给 nightly 仅报告。
+      - name: Static security scan (bandit, medium+)
+        working-directory: backend
+        run: bandit -r app/ -ll
 
       - name: Migration smoke test (SQLite)
         working-directory: backend
@@ -78,12 +87,29 @@ jobs:
           alembic upgrade head
           python scripts/check_schema.py
 
+      # 覆盖率只在 3.12 腿启用（见 matrix.include）：3.11 腿不带 --cov，自然不做覆盖率判定。
+      #
+      # 覆盖率下限**写在这条命令上而不是 pyproject.toml 里**：下限是"针对某个测试子集"的
+      # 判断，不是仓库的全局属性。integration job 只跑 tests/integration/（约 32%），
+      # 套用同一个 42% 会把一次 179 个测试全过的运行报成失败 —— 这已经真实发生过。
       - name: Run fast tests (unit + behavior + API security regressions)
         working-directory: backend
+        env:
+          COVERAGE: ${{ matrix.coverage }}
         run: |
-          python -m pytest tests/unit/ tests/behavior/ tests/integration/test_security_regressions.py tests/integration/test_api_auth.py -v --tb=short --cov=app --cov-report=xml --cov-report=term
+          # 用 bash 数组而不是字符串变量：`pytest $ARGS` 会被 shellcheck 判为
+          # SC2086（未加引号的变量会做词分割/通配），而 `pytest "$ARGS"` 又会把
+          # 整串当成单个参数、pytest 找不到路径。数组是唯一同时满足两者的写法。
+          ARGS=(tests/unit/ tests/behavior/ tests/integration/test_security_regressions.py tests/integration/test_api_auth.py -v --tb=short)
+          if [ "$COVERAGE" = "true" ]; then
+            python -m pytest "${ARGS[@]}" --cov=app --cov-report=xml --cov-report=term --cov-fail-under=42
+          else
+            python -m pytest "${ARGS[@]}"
+          fi
 
+      # 只有 3.12 腿产出 backend/coverage.xml（3.11 腿不采集覆盖率）。
       - name: Upload coverage to Codecov
+        if: matrix.coverage == 'true'
         uses: codecov/codecov-action@v7
         with:
           file: backend/coverage.xml
@@ -120,24 +146,21 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: '3.11'
 
-      - name: Cache pip
-        uses: actions/cache@v6
+      # 缓存改由 setup-uv 接管（原 ~/.cache/pip 缓存步骤随之移除——迁移后不再有 pip 写入）。
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
         with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-mysql-${{ hashFiles('backend/requirements.txt', 'backend/requirements-dev.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-mysql-
+          enable-cache: true
+          cache-dependency-glob: 'backend/requirements*.txt'
 
+      # --system：直接装进 actions/setup-python 选定的解释器，无需建 venv/激活。
       - name: Install dependencies
         working-directory: backend
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install -r requirements-dev.txt
+        run: uv pip install --system -r requirements.txt -r requirements-dev.txt
 
       # 两个库共用同一个 MySQL service：一条走 Alembic（未来路径），
       # 一条走 create_all（生产当前实际路径），避免另起 job 的额外开销。
@@ -177,19 +200,123 @@ jobs:
           python -c "import asyncio; from app.core.database import init_db; asyncio.run(init_db())"
           python scripts/check_schema.py --create-all --report-columns
 
+  # Integration 只在 develop 的推送（即合并）上跑，且必须等快速门禁通过。
+  # 语义：integration 永远验证「一个已通过 PR 门禁的 develop 提交」。
+  #
+  # 为什么不用 workflow_run 监听 CI Fast：该触发要求 workflow 文件存在于默认分支
+  # （本仓库的 main 只在发版时更新），会让 integration 的定义无法跟随 develop 演进。
+  # 用同 workflow 内的 needs + if 表达同一语义，且无此约束。
+  integration:
+    name: Integration Tests (MySQL + Redis)
+    needs: [backend-tests, migration-mysql]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # 只保留 3.12 一条腿：3.11 的兼容性已由 backend-tests 的 matrix 在每个 PR 上
+        # 覆盖；integration 验证的是真实服务行为，与 Python 小版本无关，
+        # 跑两条腿会让每次合并多花约 95 秒。
+        python-version: ['3.12']
+
+    # services / job 级 env / 各 step 自 ci-nightly.yml 的 backend-integration job
+    # 搬运（有意的重复：对单人项目，重复一份 job 定义比 reusable workflow 的间接层更简单）。
+    services:
+      mysql:
+        image: mysql:8.0
+        # 与 docker-compose.yml 的 MySQL 启动参数一致。CI 要模拟生产的“行为”，
+        # 而不只是连上同一个端口——否则测的是一个生产里不存在的配置。
+        # 仓库约定的 canonical collation 见 CHANGELOG。
+        command: >-
+          --character-set-server=utf8mb4
+          --collation-server=utf8mb4_unicode_ci
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: test_db
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
+    env:
+      DATABASE_URL: mysql+aiomysql://root:root@127.0.0.1:3306/test_db
+      REDIS_HOST: 127.0.0.1
+      REDIS_PORT: '6379'
+      ELASTICSEARCH_HOSTS: '["http://localhost:9200"]'
+      KAFKA_BOOTSTRAP_SERVERS: localhost:9092
+      MINIO_ENDPOINT: localhost:9000
+      # nightly 里这行在工作流级 env，这里下移到 job 级（ci-fast 的其它 job 不需要它）。
+      # 不加它，tests/integration 下 3 个带 skipif(RUN_INTEGRATION != "1") 的文件会整组跳过。
+      RUN_INTEGRATION: '1'
+
+    steps:
+      # checkout 不复刻 nightly 的 ref: ${{ inputs.ref || 'develop' }}：那一行是为
+      # schedule 只在默认分支触发准备的，且 inputs 上下文只存在于 workflow_dispatch /
+      # workflow_call。这里默认签出即 github.sha —— 本次 push 的提交本身，
+      # 与 backend-tests 验的是同一个 commit，比按分支名二次解析更精确。
+      - uses: actions/checkout@v7
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # 与 backend-tests / migration-mysql 用同一套安装方式（uv），
+      # 避免同一文件里混用 pip / uv 两种路径。
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: 'backend/requirements*.txt'
+
+      - name: Install dependencies
+        working-directory: backend
+        run: uv pip install --system -r requirements.txt -r requirements-dev.txt
+
+      - name: Migration smoke test on real MySQL
+        working-directory: backend
+        run: |
+          alembic upgrade head
+          python scripts/check_schema.py
+
+      - name: Run integration tests
+        working-directory: backend
+        run: |
+          python -m pytest tests/integration/ -v --tb=short --cov=app --cov-report=xml --cov-report=term
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v7
+        with:
+          file: backend/coverage.xml
+          flags: backend,integration
+          fail_ci_if_error: false
+
   frontend-tests:
     name: Frontend Tests
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:
       matrix:
-        node-version: [20]
+        node-version: [22]
 
     steps:
       - uses: actions/checkout@v7
 
       - name: Set up Node.js ${{ matrix.node-version }}
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: ${{ matrix.node-version }}
           cache: 'npm'
@@ -201,7 +328,8 @@ jobs:
 
       - name: Lint
         working-directory: frontend
-        run: npx eslint . --ext .vue,.ts,.tsx
+        # ESLint 9+ 移除了 --ext（改由 flat config 的 files 决定范围）
+        run: npx eslint .
 
       - name: Type check
         working-directory: frontend

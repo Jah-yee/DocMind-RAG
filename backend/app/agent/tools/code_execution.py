@@ -90,6 +90,17 @@ ALLOWED_SQL_COLUMNS: dict[str, set[str]] = {
 # Columns allowed in any table (common identifiers)
 _ALLOWED_COMMON = {"id", "created_at", "updated_at", "status", "name"}
 
+# S4(a) 安全加固：SELECT 表达式中允许出现的函数白名单。
+# 只有显式列出的函数可用，其他任何函数（如 CONCAT）一律拒绝。
+_ALLOWED_SQL_FUNCTIONS = {
+    "count", "sum", "avg", "min", "max", "coalesce", "nullif", "cast",
+    "round", "abs", "year", "month", "day", "date", "strftime",
+    "json_extract", "upper", "lower", "trim",
+}
+
+# 解析表达式时需要跳过的 SQL 关键字（别名/去重）
+_SQL_KEYWORD_TOKENS = {"as", "distinct"}
+
 
 def _is_safe_select_sql(sql: str) -> tuple[bool, str]:
     """Validate SQL is a restricted SELECT over whitelist tables/columns.
@@ -140,6 +151,18 @@ def _is_safe_select_sql(sql: str) -> tuple[bool, str]:
         if t.lower() not in ALLOWED_SQL_TABLES:
             return False, f"Table '{t}' is not in the allowed whitelist"
 
+    # S4(c) 安全加固（fail-closed）：若查询只涉及没有 organization_id 列的表
+    # （如 document_chunks、chat_messages），无法自动附加租户过滤条件。
+    # 这里直接拒绝，而不是尝试按外键自动 JOIN 回所属表 —— 自动 JOIN 在复杂
+    # 查询下容易改写错误、且可能引入跨组织数据；含 organization_id 的表与
+    # 无该列的表 JOIN（如 documents JOIN document_chunks）仍然允许。
+    filterable_tables = [
+        t.lower() for t in tables
+        if "organization_id" in ALLOWED_SQL_COLUMNS.get(t.lower(), set())
+    ]
+    if not filterable_tables:
+        return False, "Query only touches tables without organization_id and cannot be org-scoped"
+
     # 5. Extract selected columns and validate
     select_match = re.search(
         r"^select\s+(.*?)\s+from\b",
@@ -162,48 +185,29 @@ def _is_safe_select_sql(sql: str) -> tuple[bool, str]:
         if col_clean == "*":
             return False, "SELECT * is not allowed — specify columns explicitly"
 
-        # Handle aggregate functions: extract inner column reference
-        agg_match = re.match(
-            r"(count|sum|avg|min|max|coalesce|nullif|cast|round|abs|year|month|day|strftime|json_extract)\s*\((.*?)\)",
-            col_clean,
-            flags=re.IGNORECASE,
-        )
-        if agg_match:
-            inner = agg_match.group(2).strip()
-            if inner == "*" or inner == "1" or not inner:
-                # COUNT(*), COUNT(1), or empty — safe, no column reference
-                continue
-            # Check the inner column reference
-            inner_clean = re.sub(r"\s+as\s+.*", "", inner, flags=re.IGNORECASE).strip()
-            for part in inner_clean.split(","):
-                part = part.strip()
-                if not part:
-                    continue
-                tokens = re.findall(r"[a-zA-Z_][a-zA-Z0-9_]*", part)
-                tokens = [
-                    tok for tok in tokens
-                    if tok.lower()
-                    not in {"as", "distinct", "upper", "lower", "trim", "round"}
-                ]
-                if tokens and not any(tok.lower() in known_columns for tok in tokens):
-                    return False, f"Column '{col_clean}' is not in the allowed whitelist"
-            continue
+        # 去掉字符串字面量和别名（AS xxx，同时覆盖 CAST(x AS TYPE) 的类型名）
+        expr = re.sub(r"'[^']*'", " ", col_clean)
+        expr = re.sub(r'"[^"]*"', " ", expr)
+        expr = re.sub(r"\bas\s+[a-zA-Z_][a-zA-Z0-9_]*", " ", expr, flags=re.IGNORECASE)
 
-        # Extract identifier tokens (strip SQL functions/aliases)
-        tokens = re.findall(r"[a-zA-Z_][a-zA-Z0-9_]*", col_clean)
+        # S4(a) 安全加固：函数名必须来自白名单，杜绝 CONCAT(hashed_password, id)
+        # 这类"借道未授权函数读取非白名单列"的绕过
+        for func_name in re.findall(r"([a-zA-Z_][a-zA-Z0-9_]*)\s*\(", expr):
+            if func_name.lower() not in _ALLOWED_SQL_FUNCTIONS:
+                return False, f"Function '{func_name}' is not in the allowed whitelist"
+
+        # S4(a) 安全加固：表达式中"每一个"标识符都必须命中列白名单。
+        # 旧实现只要求命中一个（any），因此 CONCAT(hashed_password, id)
+        # 之类的表达式可以夹带非白名单列。
+        tokens = re.findall(r"[a-zA-Z_][a-zA-Z0-9_]*", expr)
         tokens = [
             tok for tok in tokens
-            if tok.lower()
-            not in {"as", "sum", "avg", "min", "max", "count", "distinct",
-                    "coalesce", "nullif", "cast", "upper", "lower", "trim",
-                    "round", "abs", "year", "month", "day", "date", "strftime",
-                    "json_extract", "json"}
+            if tok.lower() not in _ALLOWED_SQL_FUNCTIONS
+            and tok.lower() not in _SQL_KEYWORD_TOKENS
         ]
-        if not tokens:
-            continue
-        # At least one token must be a known column
-        if not any(tok.lower() in known_columns for tok in tokens):
-            return False, f"Column '{col_clean}' is not in the allowed whitelist"
+        for tok in tokens:
+            if tok.lower() not in known_columns:
+                return False, f"Column '{col_clean}' is not in the allowed whitelist"
 
     return True, ""
 
@@ -222,7 +226,15 @@ def _ast_safety_check(code: str) -> tuple[bool, str]:
     _FORBIDDEN = (_ast.Import, _ast.ImportFrom)
     _FORBIDDEN_CALLS = {"eval", "exec", "compile", "__import__", "open",
                         "globals", "locals", "vars", "getattr", "setattr",
-                        "delattr", "breakpoint", "input"}
+                        "delattr", "breakpoint", "input", "format", "format_map"}
+    # S5 安全加固：string.Formatter().get_field() / str.format / str.format_map /
+    # Formatter.vformat 会在字符串内部执行 getattr/getitem，绕过基于 AST 的
+    # 下划线属性检查，例如：
+    #   string.Formatter().get_field("0.__globals__[__builtins__][__import__]", ...)
+    # 因此这些属性整体禁用（含只取属性、不立即调用的形式）。
+    _FORBIDDEN_ATTRS = {"format", "format_map", "get_field", "vformat", "Formatter"}
+    # S5：字符串字面量中的 dunder 标记（如 __globals__ / __builtins__）一并拒绝
+    _DUNDER_IN_STRING = re.compile(r"__[a-zA-Z0-9_]+")
     try:
         tree = _ast.parse(code)
     except SyntaxError as e:
@@ -238,6 +250,13 @@ def _ast_safety_check(code: str) -> tuple[bool, str]:
         # 因此单下划线私有属性一并禁止。
         if isinstance(node, _ast.Attribute) and node.attr.startswith("_"):
             return False, "private/dunder attribute access is not allowed in sandbox."
+        # S5：format 系列可在字符串内部解析属性/下标，必须整体禁用
+        if isinstance(node, _ast.Attribute) and node.attr in _FORBIDDEN_ATTRS:
+            return False, f"attribute '{node.attr}' is not allowed in sandbox."
+        # S5：字符串字面量中出现 dunder 标记同样拒绝
+        if isinstance(node, _ast.Constant) and isinstance(node.value, str):
+            if _DUNDER_IN_STRING.search(node.value):
+                return False, "dunder tokens in string literals are not allowed in sandbox."
     return True, ""
 
 
@@ -344,8 +363,8 @@ async def execute_python(code: str, **_: Any) -> str:
 def _inject_org_filter(query: str, org_id: int) -> str:
     """Append an organization_id filter to a whitelisted SELECT query.
 
-    Extracted from execute_sql so it can be unit-tested. Queries that already
-    reference organization_id are left untouched.
+    Extracted from execute_sql so it can be unit-tested. 只有当查询已经把
+    organization_id 等值限定为调用者所在组织时才跳过注入。
     """
     needs_org_filter = False
     for table in ALLOWED_SQL_COLUMNS:
@@ -353,8 +372,31 @@ def _inject_org_filter(query: str, org_id: int) -> str:
             if re.search(rf"\b(?:from|join)\s+{re.escape(table)}\b", query, flags=re.IGNORECASE):
                 needs_org_filter = True
                 break
-    if not needs_org_filter or re.search(r"\borganization_id\b", query, flags=re.IGNORECASE):
+    if not needs_org_filter:
         return query
+    # S4(b) 安全加固：旧实现只要查询里出现 organization_id 就跳过注入，
+    # 于是自带 `organization_id = 3` 的查询可以完全躲开租户过滤；
+    # 现在仅当查询已把 organization_id 等值限定为"调用者的组织"时才跳过，
+    # 否则（限定的是其他组织、或仅提及该列）仍注入调用者组织条件，
+    # 由 AND 收紧结果集。
+    where_gate = re.search(r"\bwhere\b", query, flags=re.IGNORECASE)
+    if where_gate:
+        # 只在 WHERE 之后找等值条件：SELECT 列表里的 `organization_id = 3`
+        # 是投影不是过滤，不能被当作已限定。
+        tail_gate = re.search(
+            r"\b(group\s+by|order\s+by|limit|having)\b", query[where_gate.end():], flags=re.IGNORECASE,
+        )
+        where_body = (
+            query[where_gate.end(): where_gate.end() + tail_gate.start()]
+            if tail_gate else query[where_gate.end():]
+        )
+        pinned = re.search(rf"\borganization_id\s*=\s*{org_id}\b", where_body, flags=re.IGNORECASE) or re.search(
+            rf"\b{org_id}\s*=\s*organization_id\b", where_body, flags=re.IGNORECASE
+        )
+        # 即使等式存在，只要同一 WHERE 里出现 OR，条件就可能被放宽
+        # （`organization_id = 3 OR 1=1`），此时不能跳过注入。
+        if pinned and not re.search(r"\bor\b", where_body, flags=re.IGNORECASE):
+            return query
 
     where_m = re.search(r"\bwhere\b", query, flags=re.IGNORECASE)
     tail_m = re.search(

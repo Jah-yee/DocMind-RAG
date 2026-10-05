@@ -6,6 +6,9 @@ from fastapi.testclient import TestClient
 
 from app.core.database import get_db
 from app.core.security import get_current_user
+from app.models.document import Document
+from app.models.user import User
+from app.schemas.knowledge import SearchSuggestionResponse
 
 
 @pytest.fixture
@@ -26,7 +29,14 @@ class _AsyncCtxMgr:
         return False
 
 
-def _make_mock_user():
+def _make_mock_user(*, is_superuser=False):
+    """调用方主体。
+
+    `permission_required` 现在直接信任 `current_user`（它本身就是每次请求回源 DB
+    加载的 User），不再二次 `db.get(User, ...)`。所以「这个调用方有权限」只能通过
+    `current_user` 表达 —— 以前那种「`current_user` 是普通用户、但 mock 的 `db.get`
+    返回超管」的搭配不再能绕过权限检查（issue #82 / PR B）。
+    """
     user = MagicMock()
     user.id = 1
     user.username = "testuser"
@@ -34,7 +44,7 @@ def _make_mock_user():
     user.full_name = "Test User"
     user.role = "user"
     user.organization_id = 1
-    user.is_superuser = False
+    user.is_superuser = is_superuser
     user.is_active = True
     return user
 
@@ -68,6 +78,26 @@ def _make_mock_document(doc_id="doc-1", filename="report.pdf", status_name="inde
     return doc
 
 
+def _make_db_get_side_effect(document, user=None):
+    """按模型分派的 `db.get` side_effect。
+
+    同一个 `db.get` 被两处共用：`permission_required` 查 `User`（app/core/security.py:82），
+    `get_document_for_user` 查 `Document`（app/core/security.py:60）。所以只有 `Document`
+    路由能用笼统的 `return_value=`；同时经过权限校验的路由必须按模型分派，
+    否则用户 mock 会被当成文档返回（或反之），权限/存在性判断全部失真。
+    """
+    user = user if user is not None else _make_mock_db_user()
+
+    async def _side_effect(model, *args, **kwargs):
+        if model is User:
+            return user
+        if model is Document:
+            return document
+        return None
+
+    return _side_effect
+
+
 def _override_get_db(mock_db=None):
     if mock_db is None:
         mock_db = MagicMock()
@@ -94,7 +124,8 @@ class TestKnowledgeList:
     def test_list_knowledge_bases(self, client: TestClient):
         """GET /knowledge/ 应返回文档列表。"""
         from app.main import app
-        mock_user = _make_mock_user()
+        # 本用例只关心列表主流程，权限门禁用超管主体一次性通过
+        mock_user = _make_mock_user(is_superuser=True)
         doc = _make_mock_document()
 
         override_func, mock_db = _override_get_db()
@@ -130,7 +161,7 @@ class TestKnowledgeList:
     def test_list_knowledge_bases_pagination(self, client: TestClient):
         """分页参数应正确返回。"""
         from app.main import app
-        mock_user = _make_mock_user()
+        mock_user = _make_mock_user(is_superuser=True)
         doc1 = _make_mock_document(doc_id="doc-1")
         doc2 = _make_mock_document(doc_id="doc-2", filename="budget.xlsx")
 
@@ -168,7 +199,7 @@ class TestKnowledgeList:
     def test_list_knowledge_bases_empty(self, client: TestClient):
         """无文档时应返回空列表。"""
         from app.main import app
-        mock_user = _make_mock_user()
+        mock_user = _make_mock_user(is_superuser=True)
 
         override_func, mock_db = _override_get_db()
 
@@ -208,11 +239,17 @@ class TestKnowledgeStats:
     def test_get_stats_success(self, client: TestClient):
         """GET /knowledge/stats/{org_id} 应返回统计信息。"""
         from app.main import app
-        mock_user = _make_mock_user()
+        mock_user = _make_mock_user(is_superuser=True)
+
+        # permission_required 不看注入的 current_user，而是用 `db.get(User, ...)` 重查
+        # （app/core/security.py:82）。只 override get_current_user 会让校验打到真库，
+        # 查不到用户 -> get_user_permissions(db, None, ...) 直接 AttributeError。
+        override_func, _mock_db = _override_get_db()
 
         async def _override_user():
             return mock_user
 
+        app.dependency_overrides[get_db] = override_func
         app.dependency_overrides[get_current_user] = _override_user
 
         with patch("app.api.v1.endpoints.knowledge.knowledge_service") as mock_ks:
@@ -231,6 +268,7 @@ class TestKnowledgeStats:
                 assert data["success"] is True
                 assert "stats" in data
             finally:
+                app.dependency_overrides.pop(get_db, None)
                 app.dependency_overrides.pop(get_current_user, None)
 
     def test_get_stats_no_auth(self, client: TestClient):
@@ -243,7 +281,7 @@ class TestKnowledgeSearch:
     def test_search_success(self, client: TestClient):
         """POST /knowledge/search 应返回搜索结果。"""
         from app.main import app
-        mock_user = _make_mock_user()
+        mock_user = _make_mock_user(is_superuser=True)
 
         override_func, mock_db = _override_get_db()
 
@@ -284,7 +322,7 @@ class TestKnowledgeSearch:
     def test_search_no_results(self, client: TestClient):
         """无匹配结果应返回空列表。"""
         from app.main import app
-        mock_user = _make_mock_user()
+        mock_user = _make_mock_user(is_superuser=True)
 
         override_func, mock_db = _override_get_db()
 
@@ -313,7 +351,7 @@ class TestKnowledgeSearch:
     def test_search_missing_query(self, client: TestClient):
         """缺少查询参数应返回 422。"""
         from app.main import app
-        mock_user = _make_mock_user()
+        mock_user = _make_mock_user(is_superuser=True)
 
         override_func, mock_db = _override_get_db()
 
@@ -339,11 +377,17 @@ class TestKnowledgeSuggestions:
     def test_get_suggestions(self, client: TestClient):
         """GET /knowledge/suggestions 应返回建议列表。"""
         from app.main import app
-        mock_user = _make_mock_user()
+        mock_user = _make_mock_user(is_superuser=True)
 
+        # 必须连 get_db 一起 mock：`permission_required` 依赖会 `await db.get(User, ...)`
+        # 再把它交给 `permission_service`。原先只 override 了 get_current_user，
+        # 于是 `db.get` 落回真库、返回 None，请求在依赖阶段就炸了，根本到不了 handler
+        # —— 这个用例因此一直红着，且与它想验证的东西无关（issue #83 的 mock 装配类问题）。
+        override_db, _mock_db = _override_get_db()
         async def _override_user():
             return mock_user
 
+        app.dependency_overrides[get_db] = override_db
         app.dependency_overrides[get_current_user] = _override_user
 
         with patch("app.api.v1.endpoints.knowledge.knowledge_service") as mock_ks:
@@ -359,6 +403,43 @@ class TestKnowledgeSuggestions:
                 data = r.json()
                 assert len(data["suggestions"]) == 3
             finally:
+                app.dependency_overrides.pop(get_db, None)
+                app.dependency_overrides.pop(get_current_user, None)
+
+    def test_get_suggestions_response_matches_model(self, client: TestClient):
+        """成功响应必须能通过本端点自己声明的响应模型（issue #91）。
+
+        `SearchSuggestionResponse.query` 是必填字段，而 handler 原先不返回它，
+        于是响应模型校验必然失败 —— 端点不可能返回 200。这里直接拿声明的模型
+        校验响应体，缺字段会以 ValidationError 的形式当场暴露。
+        """
+        from app.main import app
+        mock_user = _make_mock_user(is_superuser=True)
+
+        override_db, _mock_db = _override_get_db()
+
+        async def _override_user():
+            return mock_user
+
+        app.dependency_overrides[get_db] = override_db
+        app.dependency_overrides[get_current_user] = _override_user
+
+        with patch("app.api.v1.endpoints.knowledge.knowledge_service") as mock_ks:
+            mock_ks.get_search_suggestions = AsyncMock(return_value=["annual report"])
+            try:
+                r = client.get(
+                    "/api/v1/knowledge/suggestions?q=annual&organization_id=1",
+                    headers={"Authorization": "Bearer test_token"}
+                )
+                assert r.status_code == 200
+                data = r.json()
+
+                # 通过响应模型 = 端点的契约成立
+                parsed = SearchSuggestionResponse.model_validate(data)
+                assert parsed.query == "annual"  # 回显原始查询串
+                assert parsed.suggestions == ["annual report"]
+            finally:
+                app.dependency_overrides.pop(get_db, None)
                 app.dependency_overrides.pop(get_current_user, None)
 
     def test_get_suggestions_no_auth(self, client: TestClient):
@@ -371,7 +452,7 @@ class TestKnowledgeRebuild:
     def test_rebuild_success(self, client: TestClient):
         """POST /knowledge/rebuild/{id} 应提交重建任务。"""
         from app.main import app
-        mock_user = _make_mock_user()
+        mock_user = _make_mock_user(is_superuser=True)
 
         doc = MagicMock()
         doc.id = "doc-1"
@@ -383,9 +464,9 @@ class TestKnowledgeRebuild:
         doc.organization_id = 1
 
         override_func, mock_db = _override_get_db()
-        mock_scalar = MagicMock()
-        mock_scalar.scalar_one_or_none.return_value = doc
-        mock_db.execute = AsyncMock(return_value=mock_scalar)
+        # 端点走的是 get_document_for_user -> db.get(Document, ...)，不是 db.execute；
+        # 且 db.get 还要先给 permission_required 返回 User，故按模型分派。
+        mock_db.get = AsyncMock(side_effect=_make_db_get_side_effect(doc))
         mock_db.add = MagicMock()
         mock_db.commit = AsyncMock()
 

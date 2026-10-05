@@ -183,6 +183,11 @@ class PERAgentLoop:
         if not remaining_steps:
             return False
 
+        # `execution_step_result` events carry structured payloads; normalise so the
+        # suffix checks below cannot crash on a non-string.
+        if not isinstance(final_output, str):
+            final_output = str(final_output)
+
         # If no output yet, definitely continue
         if len(final_output.strip()) < 50:
             return True
@@ -217,8 +222,23 @@ class PERAgentLoop:
         """
         start_time = time.perf_counter()
 
+        # Each run gets a clean working-memory scope: step ids ("s1", "s2", …)
+        # repeat across turns, so stale results from a previous run would
+        # otherwise be graded and injected into this run's step prompts.
+        self.memory.reset_working()
+
         # ── Execution Context (per-request state) ────────────────────────
         ctx = ExecutionContext(query=query)
+
+        # ── Phase 0a: Context fitting ────────────────────────────────────
+        # Compress conversation history so it fits the model's budget before
+        # it reaches the planner and executor. Without this every downstream
+        # LLM call sees whatever the caller passed in, unbounded.
+        if history:
+            try:
+                history = await self.context_engine.fit_async(history)
+            except Exception as e:
+                logger.warning(f"Context compression failed, using raw history: {e}")
 
         # ── Phase 0: Memory recall ────────────────────────────────────────
         memory_context = ""
@@ -267,7 +287,9 @@ class PERAgentLoop:
                         fallback_tool=event.fallback_tool,
                     ))
                 elif event.type == "plan_complete":
-                    plan_goal = event.plan_id
+                    # Carry the planner's own goal; never fall back to the plan id.
+                    if event.plan_goal:
+                        plan_goal = event.plan_goal
 
             if plan_steps:
                 plan = Plan(
@@ -305,33 +327,40 @@ class PERAgentLoop:
 
         if self.config.enable_tools:
             self.executor.reset_for_request()
-            async for event in self.executor.execute(
-                plan=plan,
-                history=history,
-                organization_id=self.organization_id,
-                user_id=self.user_id,
-                enable_thinking=self.config.enable_thinking,
-                ctx=ctx,
-            ):
-                yield event
-                if event.type == "chunk":
-                    final_output += event.content
-
-            # Conditional routing: if remaining steps are unlikely to add value, skip them
-            remaining_steps = [s for s in plan.steps if s.status == "pending"]
-            if remaining_steps and not self._should_continue_execution(final_output, plan, remaining_steps):
-                skipped = [s for s in remaining_steps if s.status == "pending"]
-                for s in skipped:
-                    s.status = "skipped"
-                if skipped:
-                    yield AgentEvent(
-                        type="thinking",
-                        content=f"已有充分信息，跳过 {len(skipped)} 个剩余步骤",
-                        thinking_type="evaluation",
-                        plan_id=plan.id,
-                        plan_progress=plan.progress,
-                    )
-                    logger.info("Conditional routing: %d steps skipped (sufficient info)", len(skipped))
+            execution_output = ""
+            try:
+                async for event in self.executor.execute(
+                    plan=plan,
+                    history=history,
+                    organization_id=self.organization_id,
+                    user_id=self.user_id,
+                    enable_thinking=self.config.enable_thinking,
+                    ctx=ctx,
+                ):
+                    yield event
+                    if event.type == "chunk":
+                        final_output += event.content
+                        execution_output += event.content
+                    elif event.type == "execution_step_result" and event.content:
+                        execution_output += event.content
+            finally:
+                # Conditional routing belongs in a finally so it still runs when the
+                # consumer stops early (client disconnect), and it reads everything
+                # the executor produced rather than only the bare "chunk" events.
+                remaining_steps = [s for s in plan.steps if s.status == "pending"]
+                if remaining_steps and not self._should_continue_execution(execution_output, plan, remaining_steps):
+                    skipped = [s for s in remaining_steps if s.status == "pending"]
+                    for s in skipped:
+                        s.status = "skipped"
+                    if skipped:
+                        yield AgentEvent(
+                            type="thinking",
+                            content=f"已有充分信息，跳过 {len(skipped)} 个剩余步骤",
+                            thinking_type="evaluation",
+                            plan_id=plan.id,
+                            plan_progress=plan.progress,
+                        )
+                        logger.info("Conditional routing: %d steps skipped (sufficient info)", len(skipped))
         else:
             # Tool-less mode: single LLM call
             messages = self._build_messages(query, history, context_docs, memory_context)
@@ -383,34 +412,12 @@ class PERAgentLoop:
                 yield event
                 # Check reflection decision
                 if event.type == "reflection" and event.reflection_result == "retry":
-                    # Retry specific step
                     step_id = event.plan_step_id
                     if step_id:
-                        for step in plan.steps:
-                            if step.id == step_id:
-                                step.status = "pending"
-                                step.retry_count += 1
-                                yield AgentEvent(
-                                    type="thinking",
-                                    content=f"重新执行步骤: {step.description}",
-                                    thinking_type="correction",
-                                    plan_id=plan.id,
-                                    plan_step_id=step.id,
-                                    retry_attempt=step.retry_count,
-                                )
-                                # Re-execute just this step
-                                async for retry_event in self.executor._execute_step_with_retry(
-                                    step=step,
-                                    plan=plan,
-                                    history=history,
-                                    organization_id=self.organization_id,
-                                    user_id=self.user_id,
-                                    enable_thinking=self.config.enable_thinking,
-                                ):
-                                    if retry_event.type == "chunk":
-                                        final_output += "\n\n[重试结果]\n" + retry_event.content
-                                    yield retry_event
-                                break
+                        async for evt in self._retry_step(step_id, plan, history):
+                            if evt.type == "chunk":
+                                final_output += "\n\n[重试结果]\n" + evt.content
+                            yield evt
 
             # ── Phase 3b: Adversarial Review ────────────────────────────────
             if self.config.enable_reflection and plan.steps:
@@ -485,6 +492,43 @@ class PERAgentLoop:
         )
 
         yield AgentEvent(type="done", plan_progress=1.0)
+
+    async def _retry_step(
+        self,
+        step_id: str,
+        plan: Plan,
+        history: list[dict[str, str]] | None,
+    ) -> AsyncGenerator[AgentEvent, None]:
+        """Re-execute a single step the reflector asked for, with a retry ceiling."""
+        for step in plan.steps:
+            if step.id != step_id:
+                continue
+            if step.retry_count >= self.config.max_retries_per_step:
+                logger.warning(
+                    "Reflection retry for step %s skipped: retry_count %d already at limit %d",
+                    step_id, step.retry_count, self.config.max_retries_per_step,
+                )
+                return
+            step.status = "pending"
+            step.retry_count += 1
+            yield AgentEvent(
+                type="thinking",
+                content=f"重新执行步骤: {step.description}",
+                thinking_type="correction",
+                plan_id=plan.id,
+                plan_step_id=step.id,
+                retry_attempt=step.retry_count,
+            )
+            async for retry_event in self.executor._execute_step_with_retry(
+                step=step,
+                plan=plan,
+                history=history,
+                organization_id=self.organization_id,
+                user_id=self.user_id,
+                enable_thinking=self.config.enable_thinking,
+            ):
+                yield retry_event
+            return
 
     def _build_messages(
         self,

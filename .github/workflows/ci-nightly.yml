@@ -2,8 +2,18 @@ name: CI Nightly
 
 on:
   schedule:
-    - cron: '0 2 * * *'  # 02:00 UTC daily
-  workflow_dispatch:       # manual trigger
+    # 每周一次（周一 02:00 UTC）而不是每天：integration 已由 ci-fast 在每次
+    # develop 合并时执行，这里保留的目的是**环境漂移检查** —— 即使代码没变，
+    # 上游依赖 / runner 镜像 / PyPI 包也可能变化。
+    - cron: '0 2 * * 1'
+  # 手动触发可指定分支；不填时与 schedule 一样默认测 develop。
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: '要测试的分支（默认 develop）'
+        required: false
+        default: 'develop'
+        type: string
 
 concurrency:
   group: ci-nightly-${{ github.ref }}
@@ -70,26 +80,28 @@ jobs:
 
     steps:
       - uses: actions/checkout@v7
+        with:
+          # schedule 事件只在默认分支（main）上触发，而 main 在 Git Flow 下只在
+          # 发版时更新 —— 直接跑 main 等于天天测一个陈旧快照（曾落后 develop 95 个提交，
+          # 且缺 sqlalchemy[asyncio]，导致 155 个 integration 测试全部 skip）。
+          # 这里显式签出集成分支，让 nightly 真正验证"即将发布的代码"。
+          ref: ${{ inputs.ref || 'develop' }}
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Cache pip
-        uses: actions/cache@v6
+      # 与 ci-fast 用同一套安装方式（uv），避免两个 workflow 混用 pip / uv。
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
         with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ matrix.python-version }}-${{ hashFiles('backend/requirements.txt', 'backend/requirements-dev.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-${{ matrix.python-version }}-
+          enable-cache: true
+          cache-dependency-glob: 'backend/requirements*.txt'
 
       - name: Install dependencies
         working-directory: backend
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install -r requirements-dev.txt
+        run: uv pip install --system -r requirements.txt -r requirements-dev.txt
 
       - name: Migration smoke test on real MySQL
         working-directory: backend
@@ -109,33 +121,7 @@ jobs:
           flags: backend,integration
           fail_ci_if_error: false
 
-  docker-build:
-    name: Docker Build
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-
-      - name: Build backend image
-        uses: docker/build-push-action@v7
-        with:
-          context: backend
-          push: false
-          tags: docmind-backend:${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-      - name: Build frontend image
-        uses: docker/build-push-action@v7
-        with:
-          context: frontend
-          push: false
-          tags: docmind-frontend:${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+  # Docker Build 已拆分到独立的 docker-build.yml（按路径触发，避免每天无条件重跑）。
 
   # 名字里显式写出 "audits advisory"：bandit 是阻断门禁，依赖审计不是。
   # 否则 Actions 页面上的绿色对勾会被误读成"没有已知漏洞"。
@@ -147,7 +133,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: '3.11'
 
@@ -176,9 +162,9 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
-          node-version: '20'
+          node-version: '22'
 
       # 依赖漏洞审计暂为「仅报告」：修复常受制于上游，长期红灯会被无视。
       # 但**工具自身失败必须与「发现漏洞」区分开**——pip-audit 两种情况都可能返回 1，
@@ -220,16 +206,20 @@ jobs:
           code=0
           pip-audit -r requirements.txt --format json --progress-spinner off \
             -o "$RUNNER_TEMP/pip-audit.json" || code=$?
-          # 同 npm audit：结构校验而不只是「能解析」。
-          # pip-audit 的 JSON 是 [{name, version, vulns: [...]}, ...]。
-          if ! python -c "import json,sys; d=json.load(open(sys.argv[1])); assert isinstance(d,list) and d, 'not a non-empty list'; assert all(isinstance(x,dict) and 'name' in x and 'version' in x for x in d), 'entries missing name/version'" "$RUNNER_TEMP/pip-audit.json" 2>/dev/null; then
-            echo "::error::pip-audit 未产出结构完整的报告（退出码 $code）—— 工具失败，不是发现漏洞"
+          # 结构校验走仓库内脚本，不内联 python -c——格式假设需要被测试钉住。
+          # 2026-09-20 事故：内联版假定顶层是数组，而 pip-audit 2.x 实际是
+          # {"dependencies": [...]}，于是把一份**正常且确实扫出漏洞**的报告判成了"工具失败"，
+          # nightly 因此长期红着却指向错误的原因。回归测试见 tests/unit/test_audit_report.py。
+          # 脚本的诊断写 stderr，所以这里**不重定向 stderr**——它必须留在 job 日志里。
+          # 未知形态会被拒绝并打印实际结构（脚本版本未固定，形状再变也要响亮地失败）。
+          if ! python scripts/audit_report.py --summary "$RUNNER_TEMP/pip-audit.json" > "$RUNNER_TEMP/pip-audit.md"; then
+            echo "::error::pip-audit 未产出结构完整的报告（退出码 $code）—— 工具失败，不是发现漏洞；原因见上方 stderr"
             exit 1
           fi
           {
             echo "## 后端依赖审计 —— ⚠️ STATUS: ADVISORY ONLY"
             echo "> 仅报告,**不阻断构建**。此项为绿色不代表没有已知漏洞。"
-            python -c "import json,sys; d=json.load(open(sys.argv[1])); v=[(x['name'],x['version'],'|'.join(i['id'] for i in x.get('vulns',[]))) for x in d if x.get('vulns')]; print('未发现已知漏洞。' if not v else '发现 %d 个存在漏洞的依赖：' % len(v)); [print('- %s %s — %s' % t) for t in v]" "$RUNNER_TEMP/pip-audit.json"
+            cat "$RUNNER_TEMP/pip-audit.md"
           } >> "$GITHUB_STEP_SUMMARY"
           if [ "$code" -ne 0 ]; then
             echo "::warning::pip-audit 报告了依赖漏洞（当前策略：仅报告，不阻断）"

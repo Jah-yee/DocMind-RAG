@@ -10,6 +10,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
+from app.exceptions import AuthorizationError, NotFoundError
 from app.models.rbac import PermissionType
 from app.models.user import User
 from app.services.auth_service import auth_service
@@ -49,25 +50,48 @@ def get_user_org_id(current_user: User) -> int | None:
     )
 
 
+def require_organization(current_user: User) -> int:
+    """Resolve the caller's organization, failing closed when it is absent.
+
+    S3 安全加固：此前多处使用 `current_user.organization_id or 1` 兜底，
+    会把无组织用户静默归入 1 号组织，使其可读写其他租户的数据。
+    现在无组织一律拒绝（403）；超级管理员是全局角色，无组织时仍兜底为 1。
+    """
+    org_id = get_user_org_id(current_user)
+    if org_id is not None:
+        return int(org_id)
+    if getattr(current_user, "is_superuser", False):
+        return 1
+    raise AuthorizationError("当前用户未加入任何组织，无权访问组织数据")
+
+
 async def get_document_for_user(
     db: AsyncSession,
     current_user: User,
     document_id: str,
 ) -> "Document":
-    """Load a document and enforce org-level access in one place."""
+    """Load a document and enforce org-level access in one place.
+
+    抛 `AppError` 子类（`NotFoundError` / `AuthorizationError`）而**不是** `HTTPException`：
+    这是应用层语义错误，会被 `app/main.py:218` 的 `AppError` handler 转成正确的
+    404/403。调用方本来就都在 `except (AppError, NotFoundError, AuthorizationError, ...)`
+    里 `raise` 放行；抛 `HTTPException` 则会绕过它们、落进各自的 `except Exception`
+    被包装成 `AppError("...失败")` → **500**（见 issue #90）。
+    """
     from app.models.document import Document
 
     document = await db.get(Document, document_id)
     if not document:
-        raise HTTPException(status_code=404, detail="文档不存在")
+        raise NotFoundError("文档不存在")
 
-    org_id = get_user_org_id(current_user) or 1
-    if (
-        not current_user.is_superuser
-        and current_user.role != "admin"
-        and document.organization_id != org_id
-    ):
-        raise HTTPException(status_code=403, detail="无权访问该文档")
+    # S3 安全加固：fail closed —— 无组织用户不再兜底到 1 号组织；
+    # 非超管（含全局 role=admin 的租户管理员）只能访问本组织的文档。
+    # 组织经由 get_user_org_id() 解析，因此兼容 token_organization_id 回退。
+    if current_user.is_superuser:
+        return document
+    org_id = get_user_org_id(current_user)
+    if org_id is None or document.organization_id != org_id:
+        raise AuthorizationError("无权访问该文档")
     return document
 
 
@@ -77,10 +101,12 @@ def permission_required(required_permissions: list[PermissionType], organization
         current_user: User = Depends(get_current_user),
         db: AsyncSession = Depends(get_db)
     ):
-        # 1. 核心修复：上帝模式（优先判断超管）
-        # 必须先从数据库 reload 一下，确保 is_superuser 状态是最新的
-        user = await db.get(User, current_user.id)
-        if user and user.is_superuser:
+        # 1. 上帝模式（优先判断超管）
+        # `current_user` 由 `auth_service.get_current_user` 每次请求回源 DB 得到，
+        # 本身就是最新状态 —— 不必、也不该在这里再查一次。那次二次查询是
+        # 「缓存快照 vs DB」两套真相的来源之一：它只补救了超管位，其余字段
+        # （is_active / role / organization_id）仍然可能是快照里的旧值。
+        if current_user.is_superuser:
             return True
 
         # 2. 提取组织 ID
@@ -106,7 +132,7 @@ def permission_required(required_permissions: list[PermissionType], organization
 
         # 3. 获取用户权限集合
         # ✅ 修正：传递 user 对象，而不是 user.id
-        user_permissions = await permission_service.get_user_permissions(db, user, organization_id)
+        user_permissions = await permission_service.get_user_permissions(db, current_user, organization_id)
 
         # 4. 校验权限名 (对比字符串)
         for perm in required_permissions:

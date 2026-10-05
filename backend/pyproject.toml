@@ -55,11 +55,43 @@ line-ending = "lf"
 "tests/*" = ["A", "SLF", "N818"]
 "app/models/*" = ["F821", "F401"]  # SQLAlchemy string-based relationship() references; re-exports
 
+# pytest 的唯一配置源。backend/pytest.ini 已删除——只要它存在，pytest 就整体忽略本段
+# （pytest.ini 优先级高于 pyproject.toml），`markers` 声而不效即源于此。
 [tool.pytest.ini_options]
-asyncio_mode = "auto"
 testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+asyncio_mode = "auto"
+# 以下三键原先只存在于 pytest.ini，合并时漏搬会静默改变行为：
+#   testpaths      —— 裸跑 pytest 会收进 backend/ 根下的脚本（test_api.py 里的用例会真发 httpx 请求）
+#   asyncio_mode   —— 见下方说明
+#   filterwarnings —— 只影响告警噪音
+#
+# asyncio_mode 目前是【冗余】的：全仓 96 个 async 测试函数**全部**带显式
+# @pytest.mark.asyncio（AST 统计：未标记数为 0），实测 auto 与 strict 结果完全一致
+# （466 passed, 1 skipped）。保留它是为了不让**将来新增的**未标记 async 测试
+# 在 strict 模式下静默不执行。
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::PendingDeprecationWarning",
+]
 markers = [
     "unit: Unit tests (no external deps)",
     "integration: Integration tests (need DB/ES/Redis)",
     "slow: Slow tests (deselect with -m 'not slow')",
 ]
+
+[tool.coverage.report]
+# 这里**有意不设** fail_under。
+#
+# 覆盖率下限是一个**针对特定测试子集**的判断，不是一个全局属性：ci-fast 的 PR 门禁跑
+# unit + behavior + 两个集成文件（实测约 44%），而 integration job 只跑 tests/integration/
+# （实测约 32%）—— 同一个 42% 的下限在前者合理、在后者必然误报。
+#
+# 设成全局的下场已经发生过一次：integration job 首次运行就因 "total of 32 is less than
+# fail-under=42" 而红，尽管 179 个集成测试**全部通过** —— 门禁把一次成功的测试运行
+# 报成了失败。
+#
+# 因此下限写在**使用点**（见 .github/workflows/ci-fast.yml 的 backend-tests 3.12 腿：
+# `--cov-fail-under=42`），只有该跑全套快测的那一条命令才应用它。

@@ -1,5 +1,6 @@
 """Hybrid retriever — keyword + vector search with RRF fusion."""
 import asyncio
+import hashlib
 import logging
 import math
 import time
@@ -359,8 +360,21 @@ class HybridRetriever:
             overlap_factor = 0.9 + 0.2 * min(1.0, overlap)
             final_score = min(1.0, normalized * fresh_factor * modality * overlap_factor)
 
+            # 修复（R1/R2）：保留稳定 chunk id（优先 ES _id，缺失时用文档 id + 文本哈希合成），
+            # 供子查询合并去重与调试载荷使用；同时以 content 键携带正文，
+            # 保证重排序器（及下游 workflow 检索节点）拿到非空文档文本。
+            chunk_id = str(hit.get("_id") or "")
+            if not chunk_id:
+                # 仅用于去重的稳定标识，不是密码学用途 —— 显式标注以免被静态扫描
+                # 当作弱哈希（与本仓库其它 hashlib 调用一致）。
+                text_hash = hashlib.sha1(
+                    text.encode("utf-8"), usedforsecurity=False
+                ).hexdigest()[:16]
+                chunk_id = f"{doc_id or 'unknown'}:{text_hash}"
+
             documents.append({
-                "text": text, "filename": source.get("filename", "未知"),
+                "text": text, "content": text, "filename": source.get("filename", "未知"),
+                "chunk_id": chunk_id,
                 "score": round(final_score, 4), "raw_score": fused_score,
                 "snippet": snippet, "document_id": source.get("document_id"),
                 "mmr_score": float(hit.get("_mmr_score", 0)),

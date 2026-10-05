@@ -1,0 +1,29 @@
+# labeler v5 配置。key 必须是仓库中已存在的标签名，否则 labeler 静默跳过整条规则。
+# 已用 GitHub API 只读查询确认仓库全量标签（14 个）：
+#   bug, dependencies, documentation, duplicate, enhancement, github_actions,
+#   good first issue, help wanted, invalid, javascript, python, question,
+#   tech-debt, wontfix
+# 任务书示例中的 backend / frontend / ci / docs 四个标签在仓库中并不存在，
+# 照抄会让规则静默失效，故改用语义等价的既有标签：
+#   python         <- 原 "backend"    （dependabot 预置：Pull requests that update python code）
+#   javascript     <- 原 "frontend"   （Pull requests that update javascript code）
+#   github_actions <- 原 "ci"         （Pull requests that update GitHub Actions code）
+#   documentation  <- 原 "docs"
+# 另新增 dependencies 规则：覆盖依赖清单文件的更新（dependabot PR 等）。
+python:
+  - changed-files:
+      - any-glob-to-any-file: 'backend/**'
+javascript:
+  - changed-files:
+      - any-glob-to-any-file: 'frontend/**'
+github_actions:
+  - changed-files:
+      - any-glob-to-any-file: '.github/**'
+documentation:
+  - changed-files:
+      - any-glob-to-any-file: ['**/*.md', 'docs/**']
+dependencies:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'backend/requirements*.txt'
+          - 'frontend/package-lock.json'

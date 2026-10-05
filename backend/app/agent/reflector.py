@@ -106,11 +106,13 @@ class Reflector:
         plan: Plan,
         results: dict[str, Any],
         ctx=None,
-    ) -> AsyncGenerator[AgentEvent, ReflectionResult]:
+    ) -> AsyncGenerator[AgentEvent, None]:
         """Evaluate execution results and decide next action.
 
-        Yields: thinking and reflection events
-        Returns: ReflectionResult (via generator return sent from caller)
+        Yields: reflection events. The final one carries the structured verdict
+        (achievement / gaps / quality issues) rendered into its `content` — an
+        async generator cannot return a value, so it cannot be delivered any
+        other way.
         """
         lf = None
         span = None
@@ -132,15 +134,10 @@ class Reflector:
             _reflection_stats["quick_pass_count"] += 1
             if span:
                 span.end(output="quick_pass")
-            yield AgentEvent(
-                type="reflection",
-                reflection_result="pass",
-                content="所有步骤已成功完成，结果完整。",
-                plan_id=plan.id,
-                plan_progress=1.0,
-            )
             await self._record_reflection(plan, "pass", "All steps completed successfully")
-            ReflectionResult(achievement=100, decision="pass", reasoning="All steps completed")
+            yield self._summary_event(plan, ReflectionResult(
+                achievement=100, decision="pass", reasoning="All steps completed successfully",
+            ))
             return
 
         # Build reflection prompt
@@ -181,7 +178,9 @@ class Reflector:
                 plan_id=plan.id,
                 plan_progress=plan.progress,
             )
-            ReflectionResult(achievement=80, decision="pass", reasoning="Reflection skipped due to error")
+            yield self._summary_event(plan, ReflectionResult(
+                achievement=80, decision="pass", reasoning="Reflection skipped due to error",
+            ))
             return
 
         decision = reflection_data.get("decision", "pass")
@@ -197,6 +196,7 @@ class Reflector:
             reflection_result=decision,  # type: ignore
             content=reasoning,
             plan_id=plan.id,
+            plan_step_id=reflection_data.get("retry_step_id") or "",
             plan_progress=plan.progress,
         )
 
@@ -206,15 +206,37 @@ class Reflector:
         if span:
             span.end(output=f"decision={decision}, achievement={reflection_data.get('achievement', '?')}")
 
-        ReflectionResult(
+        yield self._summary_event(plan, ReflectionResult(
             achievement=reflection_data.get("achievement", 85),
             gaps=reflection_data.get("gaps", []),
             quality_issues=reflection_data.get("quality_issues", []),
             decision=decision,
             retry_step_id=reflection_data.get("retry_step_id"),
             reasoning=reasoning,
+        ))
+
+    def _summary_event(self, plan: Plan, result: ReflectionResult) -> AgentEvent:
+        """Render the structured reflection verdict as an event.
+
+        An async generator cannot `return` a value, so the verdict travels as the
+        `content` of a final reflection event. Content is empty when the run was
+        clean, which keeps the stream byte-identical to a no-issues run.
+        """
+        parts: list[str] = []
+        if result.gaps:
+            parts.append("发现的缺口:\n" + "\n".join(f"- {g}" for g in result.gaps))
+        if result.quality_issues:
+            parts.append("质量问题:\n" + "\n".join(f"- {q}" for q in result.quality_issues))
+        content = f"完成度 {result.achievement}" if parts else ""
+        if parts:
+            content += "\n" + "\n".join(parts)
+        return AgentEvent(
+            type="reflection",
+            reflection_result=result.decision if result.decision in ("pass", "retry", "replan", "escalate") else "pass",
+            content=content,
+            plan_id=plan.id,
+            plan_progress=plan.progress,
         )
-        return
 
     def _quick_pass_check(self, plan: Plan, results: dict[str, Any]) -> bool:
         """Check if we can fast-pass without an LLM call."""

@@ -5,6 +5,169 @@ All notable changes to DocMind will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.22.0] - 2026-10-05
+
+### Security
+
+- **工作流检索节点可跨租户读取知识库**（P0）。`tool_search` 节点的 `organization_id`
+  取自**请求体** `input`，而执行端点只校验工作流归属 —— 任意登录用户 POST
+  `{"organization_id": 42}` 即可读取其他组织的知识库内容，省略该字段则读 1 号组织。
+  现改为由服务端注入调用者所属组织，客户端传值一律忽略。
+- **组织域接口只校验权限、不校验成员身份**。`role` 是用户表上的**全局**字段，
+  因此任一租户管理员（`role="admin"`）可跨组织读写删其他组织的数据。
+  现为非超管必须 `current_user.organization_id == org_id`。
+- **`get_document_for_user` 移除 `role != "admin"` 旁路**（契约变更）。该条件让
+  任一租户管理员可读其他组织的文档。超管的跨组织访问不受影响。
+  原有的 `test_admin_crosses_org_boundary` 断言的正是该越权行为，已改写为
+  `test_tenant_admin_does_not_cross_org_boundary` 并补同组织放行的对照用例。
+- **"无组织"被静默当作 1 号组织**。注册产生的 `organization_id=None` 用户，
+  在 `current_user.organization_id or 1` 的兜底路径下会获得 1 号组织的读写权限。
+  现改为 fail-closed（403）。
+- **`execute_sql` 的列白名单与租户过滤均可绕过**。旧实现只要求每个 select 表达式中
+  **有一个**标识符命中白名单，且只要查询里出现 `organization_id` 字样就跳过过滤注入。
+  现要求全部标识符命中、函数名走白名单，且仅在等值限定为调用者组织时才跳过注入
+  （`OR` 放宽与 SELECT 投影伪装两种绕过已封堵）。
+- **代码沙箱可经 `string.Formatter().get_field()` 逃逸至 RCE**。AST 检查看不到
+  字符串字面量内部的属性访问。现封禁 `format`/`format_map`/`Formatter` 家族并扫描
+  字面量中的 dunder。
+- **用户删除与审计日志缺少组织校验**；补齐后与兄弟端点一致。
+
+### Added
+
+- **`integration` job**（`ci-fast.yml`）：`needs: [backend-tests, migration-mysql]` +
+  `if: push && refs/heads/develop`。语义是「integration 永远验证一个已通过快速门禁的
+  develop 提交」。**此前 179 个集成测试从未在 CI 中运行过**（nightly 在第一步即失败，
+  后续被 skip）。
+- **`dependency-review.yml`**：只审查本 PR 新增/升级依赖的已知漏洞，`high+` 阻断，
+  scope 为 `runtime + development`（默认只含 runtime，而本仓库 4/6 个 high 源自
+  devDependency）。
+- **`docs/ci-charter.md`**：CI 章程，写明各门禁职责、边界、以及"新增检查必须验证
+  fail-closed"的硬规则。
+- **`ci-hygiene.yml`**：commitlint（只校验 PR 新增提交）、PR 自动打标签、冲突标记检测。
+- **`docker-build.yml`**：容器相关文件变更时才构建（此前占 nightly 墙钟的 99%，
+  且每天无条件重跑）。
+
+### Changed
+
+- **`ci-nightly.yml` 由每天改为每周一**，定位调整为「环境漂移检查」；其 `checkout`
+  显式指向 `develop`（`schedule` 只在默认分支触发的平台语义）。
+- **pip 全面换 `uv`**（`ci-fast` 三处 + `ci-nightly` 一处）。`security` job 有意保留
+  pip：它没有 `setup-python`，`--system` 的锚定方式不同且与 `pip-audit` 行为耦合。
+- **覆盖率门禁收口**：`fail_under` 从 `pyproject.toml`（全局）移到使用点
+  （`--cov-fail-under=42` 只加在 backend-tests 的 3.12 腿）。全局设置会让只跑
+  `tests/integration/`（约 32%）的 integration job 误报失败 —— 尽管 179 个测试全过。
+- 依赖更新：axios、redis、pypdf、pyjwt、python-jose、aiosqlite、vue-i18n 等。
+
+### Fixed
+
+- **agent 核心 13 处「架构存在但运行时不生效」的接线断点**：
+  - `executor` 向 `AgentEvent` 传了不存在的关键字 `reflect_result`，任何工具失败都会
+    抛 `TypeError` 并被外层 `except` 吞掉，模型收到的是 Python 报错；
+  - **重试机制整条是死代码**：`error_type` 从未被赋值，策略恒落到 `unknown → fatal`，
+    首次失败即跳 fallback，`max_retries`/退避/重试提示全部不可达；
+  - `ContextEngine` 被实例化但 `fit()` 从未调用，上下文压缩从未运行；且其
+    `_truncate_messages` 用字符数换算 token 预算，每轮必然超支；
+  - `ReflectionResult` 被丢弃（异步生成器不允许 `return` 值），`retry_step_id`
+    既未进事件也未使用，loop 中的重试分支从未触发；
+  - `plan_goal` 被 `plan_id` 覆盖，所有目标感知的 LLM 评估都在评判一个随机 hex id；
+  - 条件路由 `_should_continue_execution` 恒不可达；工作记忆跨轮次污染下游提示词；
+    并行步骤在客户端断开时不取消；`ExecutorAgent` 以空参数调用工具；
+    `web_search` 的阻塞调用冻结事件循环。
+- **RAG 管线**：重排器拿到空文档文本；语义分块超长时截断而非切分（静默丢内容）；
+  子查询合并去重键恒为空；检索缓存与答案缓存共用命名空间导致空回答。
+- **CI**：`pip-audit` 结构校验把正常报告判成"工具失败"；`pytest.ini` 遮蔽
+  `pyproject.toml` 导致 markers 失效；`requirements.txt` 缺 `sqlalchemy[asyncio]`
+  导致 CI 无 greenlet；`conflict-markers` 首版恒绿（三点 diff 在浅克隆下 fatal，
+  被管道 grep 的退出码掩盖）；`retriever.py` 的 SHA1 静态扫描告警。
+
+
+- **CI：nightly 的 pip-audit 结构校验把正常报告判成"工具失败"**（`ci-nightly.yml`）。
+  该校验内联在 workflow 里，并写死了「pip-audit 的 JSON 是顶层数组」这个假设；而 pip-audit 2.x
+  实际输出的是 `{"dependencies": [...], "fixes": [...]}`。于是一份**结构完全正常、也确实扫出了
+  漏洞**的报告被判为工具失败，Security Scan 长期红着却指向一个错误的原因——比不做校验更糟，
+  因为它消耗掉排查者的信任。解析逻辑已移入 `backend/scripts/audit_report.py`（兼容两种顶层形态，
+  未知形态按工具失败拒绝并打印实际结构），格式假设由 `tests/unit/test_audit_report.py` 用真实输出
+  样本钉住。顺带修正两处：diagnostic 不再被 `2>/dev/null` 吞掉；摘要强制 UTF-8 输出
+  （`$GITHUB_STEP_SUMMARY` 要求 UTF-8，而 stdout 被重定向时 Python 默认用 locale 编码）。
+- **测试配置：`pytest.ini` 遮蔽了 `pyproject.toml`，导致 markers 全部失效**（issue #86）。
+  pytest 的配置优先级是 `pytest.ini` > `pyproject.toml`，两份配置并存时后者被整体忽略，
+  于是 `pyproject.toml` 里声明的 `unit` / `integration` / `slow` 三个 marker **从未生效**，
+  且全仓没有一个测试使用它们——`-m` 过滤实际不可用。已删除 `backend/pytest.ini`，把
+  `testpaths` / `asyncio_mode` / `filterwarnings` 三键与 markers 合并进 `pyproject.toml`
+  （单一配置源），并新增 `tests/integration/conftest.py` 按目录自动给该目录下的用例
+  打 `integration` marker。
+  合并前后 `--collect-only` 逐项一致（裸跑 633 / unit 427 / behavior 40 / integration 156），
+  `-m integration` 与 `-m "not integration"` 现可正确切分（156 / 477）。
+- **认证：缓存恢复路径的认证决策被 `except Exception` 吞掉**（issue #85）。
+  `auth_service.get_current_user` 中，「账号已被禁用」有意抛出的 `HTTPException(401)` 落在
+  同一个 `try` 的 `except Exception` 里，被吞成「回退到数据库查询」——与那行「安全加固」注释
+  声称的行为相反。最终响应仍然正确（数据库路径也会拦），但日志自相矛盾，且**任何未来加在
+  这个 `try` 里的 `HTTPException` 都会被静默吞掉**。已在 `except Exception` 之前补
+  `except HTTPException: raise`。
+- **资源不存在 / 无权限时接口返回 500 而非 404/403**（issue #90）。
+  `app/core/security.py` 的 `get_document_for_user` 抛的是 `HTTPException(404/403)` ——
+  **状态码是对的**，但 `HTTPException` 不是 `AppError`。而调用方清一色只
+  `except (AppError, NotFoundError, AuthorizationError, ...)` 放行，于是它落进各自的
+  `except Exception` 被包装成 `AppError("...失败")` → **500**。表现是日志里记着
+  「404: 文档不存在」而响应却是 500，自相矛盾。
+  已改为抛 `NotFoundError` / `AuthorizationError`（`AppError` 子类），
+  **一处修改覆盖全部 5 个调用点**（`documents.py:279,330,383`、`knowledge.py:312,519`）。
+  回归测试 `tests/unit/test_document_access_guard.py` 断言的核心是**「异常类型必须是
+  `AppError` 子类」而不是「状态码是 404」** —— 只有前者才能保证调用方的 `except` 接得住，
+  后者正是漏掉的那一半。
+- **认证失败响应契约：「用户不存在」与「账号被禁用」不再可区分**（issue #82 的 PR A）。
+  此前同一件事有**三种答案**：DB 路径对用户不存在返回 **404** `"用户不存在"`、
+  禁用返回 **401** `"账号已被禁用"`、而 `permission_required` 路径直接 **500**。
+  OWASP Authentication Cheat Sheet 要求这两种情况返回同一个 generic 响应，
+  否则构成 discrepancy factor —— 攻击者拿一个过期 token 轮询即可枚举有效用户 id。
+  现统一为 **401 + 同一 `detail`（"认证失败"）+ 同一响应头**，区分只保留在服务端日志
+  （`user_not_found` / `user_inactive`）。
+  同时修正 `app/main.py` 的 HTTPException handler **静默丢弃 `WWW-Authenticate`**：
+  它构造 `JSONResponse` 时没传 `headers=exc.headers`，导致 `auth_service` 里四处显式
+  设置的响应头**一个都到不了客户端**，而 RFC 9110 规定 401 **MUST** 携带该头。
+
+  **行为变更**：客户端若依赖「用户不存在 → 404」需同步调整。
+  已核查前端 `src/`：**不存在**这种依赖（`404` 的用法只有两处，且都是死代码；
+  也没有任何按 `detail` 文案判断的逻辑）。
+
+  同一 oracle 在 `/auth/refresh` 还有一处（`auth.py` 用「用户不存在」与
+  「账号已被禁用」两个不同文案），也已统一。修它时暴露出**同一 bug 类的第 5 处**：
+  该端点的 `except Exception` 会把 `_auth_failed()` 抛出的 `HTTPException` 吞成
+  `AppError("刷新令牌失败")` → 500，已一并补上 `except HTTPException: raise`。
+  同时给 `AppError` handler 的 **401 响应补上 `WWW-Authenticate`** ——
+  `AuthenticationError` 及其子类走的是这条 handler，此前同样没有该头。
+- **`GET /knowledge/suggestions` 不可能返回 200**（issue #91）。
+  端点声明 `response_model=SearchSuggestionResponse`，而该模型的 `query` 字段是必填
+  （字段描述即「原始查询」），handler 的成功返回值里却只有 `success` / `suggestions`。
+  于是**成功路径必然触发响应模型校验失败**
+  （`ResponseValidationError: {'type': 'missing', 'loc': ('response', 'query')}`），
+  被全局异常处理兜成 500 —— 该端点**没有任何一条路径能返回 200**，而 500 的成因
+  （响应模型不匹配）在报错里完全看不出来。已按裁定补上 `"query": q`（回显原始查询串，
+  与字段描述一致），**schema 未改**。
+  回归测试 `TestKnowledgeSuggestions::test_get_suggestions_response_matches_model`
+  直接拿端点自己声明的模型校验响应体。同文件原有的 `test_get_suggestions` 也一并修好：
+  它只 override 了 `get_current_user` 而没 override `get_db`，请求在 `permission_required`
+  依赖里就炸了，**从未跑到过 handler**（issue #83 的 mock 装配类问题），
+  并非「一直红着」的合法红灯。
+
+  回归（`tests/unit` + `tests/integration`）：基线 7 failed / 589 passed → 6 failed / 595 passed，
+  失败集合逐条相同，多出的 6 个 passed 即本 PR 新增与修好的用例。
+- **组织树查询对「认证主体不存在」无防护**（issue #82 的 5.2）。
+  `organization_service.get_organization_tree` 直接解引用 `user.is_superuser`，
+  `user` 为 None 时抛 `AttributeError` —— 与 `permission_service.py:30` 是同一类缺陷。
+  **实测症状与 issue 描述不同**：方法体内的兜底 `except Exception` 把它吞成空树
+  （`await get_organization_tree(db, None)` → `[]`），调用方拿到的是
+  **200 + `data: []`** 而不是 500 —— 问题没变小，反而更难发现：
+  **认证失败被伪装成一次成功的空查询**。
+  已加显式守卫并抛 `AuthenticationError`（**401**）：401 而非 403，因为 403 的前提是
+  「已认证但权限不足」，而这里根本不知道请求者是谁；401 而非空结果，因为本方法返回的
+  正是**授权可见范围**（超管看全树），对未建立身份的主体回一个「成功的空结果」
+  等于用一个合法业务响应回答认证问题。这与 PR A 刚统一的 401 契约一致
+  （`_auth_failed()` 覆盖的第三种情形正是「主体无法建立」）。
+  守卫**放在 `try` 之外** —— 放进 try 会被同一个兜底 `except` 吞掉，等于没抛。
+  同时给调用方 `app/api/v1/endpoints/organizations.py` 的 `except Exception` 之前补
+  `except AppError: raise`，否则 401 会被重新包装成 `AppError` → 500（与 issue #90 同一修法）。
+
 ## [1.21.0] - 2026-09-12
 
 ### Fixed

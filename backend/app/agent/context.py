@@ -225,19 +225,32 @@ class ContextEngine:
     def _truncate_messages(
         self, messages: list[dict[str, str]], token_budget: int
     ) -> list[dict[str, str]]:
-        """Last resort: truncate individual messages to fit budget."""
-        max_chars = int(token_budget * CHARS_PER_TOKEN)
-        result = []
+        """Last resort: truncate individual messages so the total fits the budget.
+
+        This is the final guarantee of the class contract, so it measures in the
+        same unit as estimate_tokens (real tokens) rather than in characters —
+        mixing the two units let the result overshoot the budget on every pass.
+        """
+        result: list[dict[str, str]] = []
         used = 0
         for msg in messages:
-            content = msg.get("content", "")
-            remaining = max_chars - used
+            remaining = token_budget - used
             if remaining <= 0:
                 break
-            if len(content) > remaining:
-                content = content[:remaining - 10] + "...[truncated]"
+            content = msg.get("content", "")
+            content_tokens = estimate_tokens(content)
+            if content_tokens > remaining:
+                # Cut to the token budget directly; chars ≈ tokens * CHARS_PER_TOKEN
+                # is only a starting guess, so re-encode and trim until it fits.
+                keep = max(1, int(remaining * CHARS_PER_TOKEN))
+                content = content[:keep] + "...[truncated]"
+                while estimate_tokens(content) > remaining and keep > 1:
+                    keep = int(keep * 0.8)
+                    content = content[:keep] + "...[truncated]"
+                if estimate_tokens(content) > remaining:
+                    continue
             result.append({**msg, "content": content})
-            used += len(content) + 4
+            used += estimate_tokens(content) + 4
         return result
 
     def inject_tool_results(

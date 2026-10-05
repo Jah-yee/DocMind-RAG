@@ -7,6 +7,8 @@ from fastapi.testclient import TestClient
 
 from app.core.database import get_db
 from app.core.security import get_current_user
+from app.models.document import Document
+from app.models.user import User
 
 
 @pytest.fixture
@@ -27,7 +29,14 @@ class _AsyncCtxMgr:
         return False
 
 
-def _make_mock_user(org_id=1):
+def _make_mock_user(org_id=1, *, is_superuser=False):
+    """调用方主体。
+
+    `permission_required` 现在直接信任 `current_user`（它本身就是每次请求回源 DB
+    加载的 User），不再二次 `db.get(User, ...)`。所以「这个调用方有权限」只能通过
+    `current_user` 表达 —— 以前那种「`current_user` 是普通用户、但 mock 的 `db.get`
+    返回超管」的搭配不再能绕过权限检查（issue #82 / PR B）。
+    """
     user = MagicMock()
     user.id = 1
     user.username = "testuser"
@@ -35,17 +44,18 @@ def _make_mock_user(org_id=1):
     user.full_name = "Test User"
     user.role = "user"
     user.organization_id = org_id
-    user.is_superuser = False
+    user.is_superuser = is_superuser
     user.is_active = True
     return user
 
 
-def _make_mock_db_user():
-    """用于 db.get(User, ...) 返回的超管用户，绕过权限检查。"""
+def _make_mock_db_user(is_superuser=True):
+    """用于 db.get(User, ...) 返回的用户，默认超管以绕过权限检查。"""
     u = MagicMock()
     u.id = 1
-    u.is_superuser = True
-    u.role = "admin"
+    u.is_superuser = is_superuser
+    u.role = "admin" if is_superuser else "user"
+    u.organization_id = 1
     return u
 
 
@@ -74,6 +84,26 @@ def _make_mock_document(doc_id="doc-123", filename="test.pdf"):
     return doc
 
 
+def _make_db_get_side_effect(document, user=None):
+    """按模型分派的 `db.get` side_effect。
+
+    同一个 `db.get` 被两处共用：`permission_required` 查 `User`（app/core/security.py:82），
+    `get_document_for_user` 查 `Document`（app/core/security.py:60）。所以只有 `Document`
+    路由能用笼统的 `return_value=`；同时经过权限校验的路由必须按模型分派，
+    否则用户 mock 会被当成文档返回（或反之），权限/存在性判断全部失真。
+    """
+    user = user if user is not None else _make_mock_db_user()
+
+    async def _side_effect(model, *args, **kwargs):
+        if model is User:
+            return user
+        if model is Document:
+            return document
+        return None
+
+    return _side_effect
+
+
 def _override_get_db(mock_db=None):
     if mock_db is None:
         mock_db = MagicMock()
@@ -100,7 +130,8 @@ class TestDocumentUpload:
     def test_upload_success(self, client: TestClient):
         """上传有效文件应返回 201 或 200。"""
         from app.main import app
-        mock_user = _make_mock_user()
+        # 本用例只关心上传主流程，权限门禁用超管主体一次性通过
+        mock_user = _make_mock_user(is_superuser=True)
         override_func, mock_db = _override_get_db()
 
         async def _override_user():
@@ -141,9 +172,17 @@ class TestDocumentUpload:
         from app.main import app
         mock_user = _make_mock_user()
 
+        override_func, mock_db = _override_get_db()
+        # permission_required 不看注入的 current_user，而是用 `db.get(User, current_user.id)`
+        # 重查（app/core/security.py:82）；只 override get_current_user 会让校验打到真库，
+        # 查不到 id=1 的用户 -> get_user_permissions(db, None, ...) 直接 AttributeError。
+        # 这里让重查返回非超管，才会真正走到「权限不足 -> 403」。
+        mock_db.get = AsyncMock(return_value=_make_mock_db_user(is_superuser=False))
+
         async def _override_user():
             return mock_user
 
+        app.dependency_overrides[get_db] = override_func
         app.dependency_overrides[get_current_user] = _override_user
 
         try:
@@ -154,16 +193,21 @@ class TestDocumentUpload:
             )
             assert r.status_code == 403
         finally:
+            app.dependency_overrides.pop(get_db, None)
             app.dependency_overrides.pop(get_current_user, None)
 
     def test_upload_no_file(self, client: TestClient):
         """不传文件应返回 422。"""
         from app.main import app
-        mock_user = _make_mock_user()
+        mock_user = _make_mock_user(is_superuser=True)
+
+        # 默认 _override_get_db() 的 db.get 返回超管 -> 权限放行，才会走到缺 file 的 422。
+        override_func, _mock_db = _override_get_db()
 
         async def _override_user():
             return mock_user
 
+        app.dependency_overrides[get_db] = override_func
         app.dependency_overrides[get_current_user] = _override_user
 
         try:
@@ -171,8 +215,9 @@ class TestDocumentUpload:
                 "/api/v1/documents/upload",
                 headers={"Authorization": "Bearer test_token"}
             )
-            assert r.status_code in (422, 500)
+            assert r.status_code == 422
         finally:
+            app.dependency_overrides.pop(get_db, None)
             app.dependency_overrides.pop(get_current_user, None)
 
     def test_upload_no_auth(self, client: TestClient):
@@ -288,11 +333,26 @@ class TestDocumentContent:
         app.dependency_overrides[get_current_user] = _override_user
 
         with patch("app.core.elasticsearch.ElasticsearchTools") as mock_es:
+            # 索引侧同时写 `content` 与 `chunk_text` 两个字段（app/worker/doc_processor.py:174-175），
+            # 而端点读的是 `chunk_text`（app/api/v1/endpoints/documents.py:351）。
+            # 原 mock 只给 `content`，于是每个 hit 都取到空串，join 出 "\n"。
             mock_es.search_documents = AsyncMock(return_value={
                 "hits": {
                     "hits": [
-                        {"_source": {"content": "This is chunk 1.", "metadata": {"chunk_index": 0}}},
-                        {"_source": {"content": "This is chunk 2.", "metadata": {"chunk_index": 1}}},
+                        {
+                            "_source": {
+                                "content": "This is chunk 1.",
+                                "chunk_text": "This is chunk 1.",
+                                "metadata": {"chunk_index": 0},
+                            }
+                        },
+                        {
+                            "_source": {
+                                "content": "This is chunk 2.",
+                                "chunk_text": "This is chunk 2.",
+                                "metadata": {"chunk_index": 1},
+                            }
+                        },
                     ]
                 }
             })
@@ -319,13 +379,13 @@ class TestDocumentDelete:
     def test_delete_document_success(self, client: TestClient):
         """删除文档应返回成功。"""
         from app.main import app
-        mock_user = _make_mock_user()
+        mock_user = _make_mock_user(is_superuser=True)
         doc = _make_mock_document()
 
         override_func, mock_db = _override_get_db()
-        mock_result = MagicMock()
-        mock_result.scalar_one_or_none.return_value = doc
-        mock_db.execute = AsyncMock(return_value=mock_result)
+        # 端点走的是 get_document_for_user -> db.get(Document, ...)，
+        # 不是 db.execute；且 db.get 还要先给 permission_required 返回 User，故按模型分派。
+        mock_db.get = AsyncMock(side_effect=_make_db_get_side_effect(doc))
 
         async def _override_user():
             return mock_user
@@ -351,12 +411,11 @@ class TestDocumentDelete:
     def test_delete_document_not_found(self, client: TestClient):
         """不存在的文档删除应返回 404。"""
         from app.main import app
-        mock_user = _make_mock_user()
+        mock_user = _make_mock_user(is_superuser=True)
 
         override_func, mock_db = _override_get_db()
-        mock_result = MagicMock()
-        mock_result.scalar_one_or_none.return_value = None
-        mock_db.execute = AsyncMock(return_value=mock_result)
+        # Document 查不到 -> get_document_for_user 抛 404；User 仍返回超管让权限放行。
+        mock_db.get = AsyncMock(side_effect=_make_db_get_side_effect(None))
 
         async def _override_user():
             return mock_user
