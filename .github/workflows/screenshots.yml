@@ -77,14 +77,17 @@ jobs:
             # 首次运行：图床分支还不存在，现场创建
             git checkout -q --orphan screenshots
             git rm -rq --cached . 2>/dev/null || true
-            printf '# PR 截图（图床分支）\n\n由 `.github/workflows/screenshots.yml` 自动维护，请勿手工修改。\n' > README.md
+            printf '# PR 截图（图床分支）\n\n由 ".github/workflows/screenshots.yml" 自动维护，请勿手工修改。\n' > README.md
           fi
 
           mkdir -p "$img_dir"
           cp "$GITHUB_WORKSPACE"/frontend/screenshots-out/*.png "$img_dir"/
 
-          # 只保留最近 20 次推送的图，避免分支无限膨胀
-          ls -1dt screenshots/*/ 2>/dev/null | tail -n +21 | xargs -r rm -rf
+          # 只保留最近 20 次推送的图，避免分支无限膨胀。
+          # 用 find 而非 ls：目录名是 commit sha，虽不含特殊字符，但 shellcheck
+          # SC2012 对 `ls` 解析文件名的方式有保留意见，find 更明确。
+          find screenshots -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' \
+            | sort -rn | tail -n +21 | cut -d' ' -f2- | xargs -r rm -rf
 
           git add -A
           git -c user.name='github-actions[bot]' \
