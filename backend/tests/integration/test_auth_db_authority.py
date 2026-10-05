@@ -331,14 +331,15 @@ async def test_db_outage_is_not_disguised_as_401(make_user):
     """数据库抖动不得被伪装成「认证失败」。
 
     PR B 之后 `get_current_user` **每个请求**都要查库，而 PR A 把「用户不存在」
-    统一成了 401。这两件事叠在一起就有一个陷阱：只要用户加载路径经过
-    `AuthService.get_user_by_id`（它 `except Exception: return None`），
+    统一成了 401。这两件事叠在一起就有一个陷阱：用户加载路径一旦经过任何把
+    「查询失败」吞成「查不到」的 helper（历史例：issue #103 前的
+    `AuthService.get_user_by_id`，`except Exception: return None`，同批已删），
     一次 DB 超时/连接中断就会被映射成「用户不存在」→ 401 → 前端清 token 跳登录页。
     用户看到「登录已过期」，真实原因是数据库挂了，而且从此每个请求都中招。
 
     所以这条断言的是：**DB 抛错时不得是 401**（当前实现让它冒泡成 5xx）。
-    它同时是 `get_user_by_id` 那个吞异常 helper 的护栏 —— 谁把加载路径改成走它，
-    这条就会红。
+    它是加载路径的护栏 —— 谁再把 DB 故障吞成 None（新 helper 或改道经过这种
+    helper），这条就会红。
     """
     user = await make_user()
 
