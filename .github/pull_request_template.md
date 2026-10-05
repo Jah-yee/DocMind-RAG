@@ -1,18 +1,76 @@
-## Description
+<!--
+  标题请遵循 Conventional Commits —— CI 的 commitlint 会校验 PR 里的每个提交：
+    <type>(<scope>): <描述>
+    type ∈ feat | fix | refactor | perf | docs | test | ci | chore
+  目标分支：develop（hotfix/* 才指向 main）
+-->
 
-<!-- Brief description of the changes -->
+## 这个 PR 做了什么
 
-## Type of Change
+<!--
+  说清楚「改了什么」和「为什么」。不要只复述 commit 标题 —— reviewer 需要的是动机。
+  如果根因不明显，把排查过程写出来（例如「表面症状是 A，实际根因是 B」）。
+-->
 
-- [ ] Bug fix
-- [ ] New feature
-- [ ] Breaking change
-- [ ] Documentation update
-- [ ] Refactoring
+## 关联 Issue
 
-## Checklist
+<!-- 填 `Closes #123` 或 `Refs #123`。没有对应 issue 的改动，请在这里说明原因。 -->
 
-- [ ] Self-reviewed the code
-- [ ] Added/updated tests
-- [ ] All tests pass locally
-- [ ] No new warnings introduced
+Closes #
+
+## 改动类型
+
+- [ ] `fix` — 修复缺陷
+- [ ] `feat` — 新增功能
+- [ ] `refactor` — 重构（不改变外部行为）
+- [ ] `perf` — 性能优化
+- [ ] `docs` — 文档
+- [ ] `test` — 测试
+- [ ] `ci` — CI / 构建 / 依赖
+- [ ] `chore` — 杂项
+
+## 破坏性变更
+
+<!--
+  破坏性变更 = 接口/契约/数据格式/权限语义发生变化，或移除既有行为。
+  如有，必须写清楚：改了哪个契约、影响谁、如何迁移、旧行为为何必须变。
+  没有就写「无」。
+-->
+
+无
+
+## 怎么验证的
+
+<!--
+  写 reviewer 能**自己复现**的步骤或命令。
+  「本地测试通过」不算证据 —— 要给出具体命令与真实结果。
+  只测了改动相关用例的话，也请如实说明（CI 会跑全量）。
+-->
+
+```bash
+# 例：
+# pytest tests/unit tests/behavior -q --no-header
+# → 612 passed, 1 skipped
+```
+
+## 截图 / 证据
+
+<!--
+  涉及 UI 改动：留空即可 —— 仓库的 `PR Screenshots` 工作流会自动抓图并**发到本 PR 的评论**里
+  （图片托管在 `screenshots` 分支，不占 PR 正文、不留悬空 blob 链接）。
+  非 UI 改动：贴关键日志、接口响应、性能对比数字等可核验的证据。
+  **不要**直接粘贴二进制、base64 或本机绝对路径。
+-->
+
+## 自审清单
+
+- [ ] 我已自审过完整 diff（不是「写完就提」）
+- [ ] 新增/修改的行为有测试覆盖；无法覆盖的部分已在上面说明了原因
+- [ ] 本地跑过完整测试套件（含 `ruff check` / `vue-tsc`），不是只跑了改动相关的用例
+- [ ] 破坏性变更已在上面标注并说明迁移方式（若无破坏性变更请一并勾选）
+- [ ] 没有提交密钥、凭证、真实用户数据或本机绝对路径
+- [ ] 若引入了新的 CI 检查，我**验证过它能失败**（永远绿的检查比没有检查更糟）
+
+---
+
+<sub>CI 必需检查：`CI Pass`。构建失败、合并冲突或 review 意见会由机器人推到本 PR。</sub>

@@ -1,0 +1,144 @@
+name: PR Screenshots
+
+# 给改动前端代码的 PR 自动配图，并把图片发到 PR 评论里。
+#
+# 为什么不用 pull_request_target：该事件在「有写权限的上下文」里运行，
+# 若再 checkout PR 的代码就等于执行不可信代码 —— 这是已知的提权模式。
+# 这里用普通 pull_request：同仓库分支的 PR 有写权限，来自 fork 的 PR 拿不到，
+# 那种情况下本工作流会跳过（见各 job 的 if）。
+on:
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - 'frontend/**'
+      - '.github/workflows/screenshots.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: screenshots-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  capture:
+    name: Capture UI
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # fork PR 的 GITHUB_TOKEN 是只读的，推分支/发评论都会 403 —— 直接跳过而不是留一个红叉。
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
+    permissions:
+      contents: write        # 推 screenshots 分支（图片图床）
+      pull-requests: write   # 发/更新 PR 评论
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci
+
+      # Playwright 浏览器缓存：key 绑定 @playwright/test 版本，
+      # 升级 Playwright 时自动失效。冷跑约 35-50s，命中缓存约 5s。
+      - name: Cache Playwright browsers
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ hashFiles('frontend/package-lock.json') }}
+
+      - name: Install Playwright chromium
+        working-directory: frontend
+        run: npx playwright install --with-deps chromium
+
+      - name: Capture screenshots
+        working-directory: frontend
+        run: node scripts/capture-screenshots.mjs screenshots-out
+
+      - name: Publish to screenshots branch
+        id: publish
+        env:
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          img_dir="screenshots/${SHA}"
+          tmp=$(mktemp -d)
+          cd "$tmp"
+          git init -q
+          git remote add origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+          if git fetch -q --depth=1 origin screenshots 2>/dev/null; then
+            git checkout -q -b screenshots origin/screenshots
+          else
+            # 首次运行：图床分支还不存在，现场创建
+            git checkout -q --orphan screenshots
+            git rm -rq --cached . 2>/dev/null || true
+            printf '# PR 截图（图床分支）\n\n由 ".github/workflows/screenshots.yml" 自动维护，请勿手工修改。\n' > README.md
+          fi
+
+          mkdir -p "$img_dir"
+          cp "$GITHUB_WORKSPACE"/frontend/screenshots-out/*.png "$img_dir"/
+
+          # 只保留最近 20 次推送的图，避免分支无限膨胀。
+          # 用 find 而非 ls：目录名是 commit sha，虽不含特殊字符，但 shellcheck
+          # SC2012 对 `ls` 解析文件名的方式有保留意见，find 更明确。
+          find screenshots -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' \
+            | sort -rn | tail -n +21 | cut -d' ' -f2- | xargs -r rm -rf
+
+          git add -A
+          git -c user.name='github-actions[bot]' \
+              -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              commit -qm "screenshots: ${SHA:0:8}"
+          git push -q origin screenshots
+
+          raw_base="https://raw.githubusercontent.com/${{ github.repository }}/screenshots/${img_dir}"
+          echo "raw_base=$raw_base" >> "$GITHUB_OUTPUT"
+          echo "已发布到 $raw_base"
+
+      - name: Comment on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        env:
+          RAW_BASE: ${{ steps.publish.outputs.raw_base }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+        with:
+          script: |
+            const base = process.env.RAW_BASE
+            const sha = process.env.SHA
+            const shots = [
+              ['登录页', 'login.png'],
+              ['仪表盘', 'dashboard.png'],
+              ['对话页', 'chat.png'],
+            ]
+            const body = [
+              `<!-- pr-screenshots -->`,
+              `## 📸 UI 截图`,
+              ``,
+              `提交 \`${sha.slice(0, 8)}\` 的自动截图（Chromium 1440×900，API 已打桩，无需后端）：`,
+              ``,
+              ...shots.flatMap(([label, file]) => [
+                `**${label}**`,
+                ``,
+                `![${label}](${base}/${file})`,
+                ``,
+              ]),
+              `<sub>由 \`.github/workflows/screenshots.yml\` 自动生成并更新；图片托管在 \`screenshots\` 分支，不占用 PR 与仓库主分支。</sub>`,
+            ].join('\n')
+
+            const marker = '<!-- pr-screenshots -->'
+            const { owner, repo } = context.repo
+            const issue_number = context.issue.number
+            const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number })
+            const existing = comments.find((c) => c.body && c.body.includes(marker))
+
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body })
+              core.info(`已更新既有评论 #${existing.id}`)
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body })
+              core.info('已创建新的截图评论')
+            }
