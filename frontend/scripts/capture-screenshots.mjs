@@ -126,9 +126,31 @@ async function main() {
       await page.goto(`${BASE_URL}${shot.path}`, { waitUntil: 'networkidle', timeout: 30_000 }).catch(() => {})
       await sleep(1200) // 等动画/图表落定
 
+      // 断言：必须停在目标页，而不是被重定向走（通常是踢回登录页）。
+      //
+      // 没有这条断言时，脚本会把**登录页**当成仪表盘/对话页拍下来，而 workflow 依然绿 ——
+      // 它当时就真的这么干过：三张图里两张是同一个登录页，字节数完全相同。抓到了错误
+      // 页面还不报错，比没有截图更糟：它给的是"有图有真相"的假象。
+      //
+      // 必须比较 pathname，不能用 `url.includes(path)` —— 被踢回登录页时 URL 是
+      // `/login?redirect=/dashboard`，**子串里就含目标路径**，includes 会返回 true，
+      // 断言形同虚设（这版断言的第一稿就是这么写的，负向测试当场把它抓了出来）。
+      const finalUrl = page.url()
+      let finalPath = ''
+      try {
+        finalPath = new URL(finalUrl).pathname
+      } catch {
+        finalPath = finalUrl
+      }
+      if (finalPath !== shot.path) {
+        throw new Error(
+          `截图 "${shot.desc}" 被重定向：期望停在 ${shot.path}，实际落在 ${finalPath}（完整 URL: ${finalUrl}）`,
+        )
+      }
+
       const file = `${OUT_DIR}/${shot.name}.png`
       await page.screenshot({ path: file, fullPage: false })
-      console.log(`[capture] ${shot.desc} -> ${file}  (实际 url=${page.url()})`)
+      console.log(`[capture] ${shot.desc} -> ${file}  (实际 url=${finalUrl})`)
     }
   } finally {
     await browser.close()
