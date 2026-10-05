@@ -14,10 +14,14 @@ stay green when the loop stalls.
 """
 
 import os
+import tempfile
 import time
 from pathlib import Path
 
-DEFAULT_HEARTBEAT_FILE = "/tmp/docmind_worker_heartbeat"
+# 默认值必须可移植：Windows 上没有 /tmp（写死会在盘根建 \tmp，且触发 bandit
+# B108 阻断门禁）。容器里 compose 显式设置 WORKER_HEARTBEAT_FILE=/tmp/...，
+# 本默认值只服务于"未显式配置"的场景（本地开发/测试），随平台解析。
+DEFAULT_HEARTBEAT_FILE = str(Path(tempfile.gettempdir()) / "docmind_worker_heartbeat")
 DEFAULT_MAX_AGE_SECONDS = 90.0
 
 

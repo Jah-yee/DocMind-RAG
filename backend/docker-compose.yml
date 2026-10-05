@@ -59,7 +59,8 @@ services:
       - ELASTICSEARCH_HOSTS=["http://docmind-elasticsearch:9200"]
       - MINIO_ENDPOINT=docmind-minio:9000
       - KAFKA_BOOTSTRAP_SERVERS=docmind-kafka:29092
-      # 存活性心跳（issue #156）：消费循环刷新该文件，健康检查读它的新鲜度
+      # 存活性心跳（issue #156）：消费循环刷新该文件，健康检查读它的新鲜度。
+      # 容器内经此变量固定 /tmp 路径；应用层默认值走 tempfile.gettempdir()（可移植）。
       - WORKER_HEARTBEAT_FILE=/tmp/docmind_worker_heartbeat
       - WORKER_HEARTBEAT_MAX_AGE_SECONDS=90
     depends_on:

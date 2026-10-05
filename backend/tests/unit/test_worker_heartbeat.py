@@ -1,11 +1,21 @@
 """Unit tests for the worker liveness heartbeat and its healthcheck (issue #156)."""
 
 import os
+import tempfile
+from pathlib import Path
 
 import pytest
 
 import worker_healthcheck
 from app.worker import heartbeat
+
+
+def test_default_heartbeat_path_is_portable():
+    # 默认值必须落在平台临时目录下：Windows 无 /tmp，写死路径既行为错误
+    # 也触发 bandit B108 阻断门禁（见 issue #156 CI）
+    default = Path(heartbeat.DEFAULT_HEARTBEAT_FILE)
+    assert default.parent == Path(tempfile.gettempdir())
+    assert default.name == "docmind_worker_heartbeat"
 
 
 def test_age_none_when_heartbeat_missing(tmp_path):
