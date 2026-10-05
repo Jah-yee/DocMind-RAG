@@ -108,6 +108,10 @@ RETRY_POLICIES: dict[str, RetryPolicy] = {
     "permission_denied": RetryPolicy(
         retryable=False, action="fatal",
     ),
+    # 工具声明了 requires_auth 但调用方没带组织上下文 —— 重试不会让它变好
+    "auth_required": RetryPolicy(
+        retryable=False, action="fatal",
+    ),
     "validation_error": RetryPolicy(
         retryable=False, action="fatal",
     ),
