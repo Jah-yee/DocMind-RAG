@@ -7,8 +7,18 @@ create_all 不会给已有表补列；在非空库上运行只会在缺表时静
 issue #154：判断「是否迁移建库」的判据是 alembic_version 里**有没有 revision 行**，
 不是表是否存在——「表在但 0 行」（create_all 建库的常见残留）此前被误判为
 迁移建库、静默走 INFO，漂移告警不响。下面 4 个状态用例覆盖该判据。
+
+issue #160：断言不经过 caplog。全量跑套件时 caplog.records 收不到
+``app.core.database`` 的记录，本文件的 4 条状态用例会集体假红——观测链路上有
+两层进程级污染：① ``app.main`` 导入时的 ``setup_logging()`` 换掉 root 的
+handler（同相位内 caplog 的 handler 被摘）；② alembic 在进程内跑 env.py 时
+``fileConfig()`` 默认 ``disable_existing_loggers=True``，把既有 logger 的
+``disabled`` 旗标置 True 且全进程残留（test_schema_path_parity 跑过一次
+``command.upgrade`` 即触发）。改为在目标 logger 上自挂收集 handler，并在
+fixture 里显式恢复 level / disabled，观测结果与进程的全局日志污染无关。
 """
 import logging
+from collections.abc import Iterator
 
 import pytest
 from sqlalchemy import text
@@ -38,9 +48,53 @@ async def _sqlite_has_table(engine, name: str) -> bool:
         ), {"name": name})).scalar())
 
 
-def _db_log_records(caplog, min_level: int) -> list[logging.LogRecord]:
+class _DbLogCollector(logging.Handler):
+    """直接挂在 ``app.core.database`` 上的记录收集器（issue #160）。
+
+    不走 caplog / root handler 链：``setup_logging()``（``app.main`` 导入时调用）
+    只换 root 上的 handler 列表；``logging.config.fileConfig()``（alembic 在进程内
+    跑 env.py 时调用，``disable_existing_loggers`` 默认 True）更狠——它把
+    ``app.core.database`` 这类既有 logger 的 ``disabled`` 旗标直接置 True，且
+    全进程残留（test_schema_path_parity 跑过 ``command.upgrade`` 之后，后续所有
+    套件的日志都被静默掉，这正是一次全量跑里本文件 4 条用例集体假红的直接原因）。
+    挂在目标 logger 自身、并显式恢复它的开关，观测结果就与进程的全局日志污染无关。
+    """
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.DEBUG)
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
+
+    def clear(self) -> None:
+        self.records.clear()
+
+
+@pytest.fixture
+def db_log_records() -> Iterator[_DbLogCollector]:
+    """收集 ``app.core.database`` 的日志记录；用完把 logger 恢复原状，避免跨用例泄漏。"""
+    logger = logging.getLogger("app.core.database")
+    collector = _DbLogCollector()
+    prev_level = logger.level
+    prev_disabled = logger.disabled
+    # root 的 level 不可控（全量跑时是 app 的 LOG_LEVEL，单独跑时是 pytest 的），
+    # 要收到 INFO 必须把 logger 自身的门也开低；disabled 旗标同理，被别的套件
+    # 置 True 后 isEnabledFor 直接短路，连 warning 都发不出。两者结束时还原。
+    logger.addHandler(collector)
+    logger.setLevel(logging.DEBUG)
+    logger.disabled = False
+    try:
+        yield collector
+    finally:
+        logger.disabled = prev_disabled
+        logger.setLevel(prev_level)
+        logger.removeHandler(collector)
+
+
+def _db_log_records(collector: _DbLogCollector, min_level: int) -> list[logging.LogRecord]:
     return [
-        r for r in caplog.records
+        r for r in collector.records
         if r.name == "app.core.database" and r.levelno >= min_level
     ]
 
@@ -81,7 +135,7 @@ ALEMBIC_VERSION_DDL = (
 
 
 async def test_warns_when_alembic_version_table_exists_but_has_zero_rows(
-    sqlite_engine, monkeypatch, caplog
+    sqlite_engine, monkeypatch, db_log_records
 ):
     """核心回归（issue #154）：表存在但 0 行 ≠ 迁移建库 → 跳过 + 漂移告警。
 
@@ -95,10 +149,10 @@ async def test_warns_when_alembic_version_table_exists_but_has_zero_rows(
         await conn.execute(text(ALEMBIC_VERSION_DDL))
         await conn.execute(text("DROP TABLE chat_messages"))  # create_all 若再跑会重建它
 
-    caplog.clear()
+    db_log_records.clear()
     await database_module.init_db()
 
-    warnings = _db_log_records(caplog, logging.WARNING)
+    warnings = _db_log_records(db_log_records, logging.WARNING)
     assert warnings, "alembic_version 表在但 0 行：必须打漂移告警（issue #154）"
     msg = "".join(r.getMessage() for r in warnings)
     assert "alembic_version" in msg and "没有 revision 记录" in msg
@@ -110,7 +164,7 @@ async def test_warns_when_alembic_version_table_exists_but_has_zero_rows(
 
 
 async def test_info_without_warning_when_alembic_version_has_revision(
-    sqlite_engine, monkeypatch, caplog
+    sqlite_engine, monkeypatch, db_log_records
 ):
     """非空 + 有 revision 行 = 确属迁移管理 → 跳过 + INFO，且无任何告警。"""
     monkeypatch.setattr(database_module, "engine", sqlite_engine)
@@ -123,12 +177,11 @@ async def test_info_without_warning_when_alembic_version_has_revision(
         ))
         await conn.execute(text("DROP TABLE chat_messages"))
 
-    caplog.clear()
-    with caplog.at_level(logging.INFO, logger="app.core.database"):
-        await database_module.init_db()
+    db_log_records.clear()
+    await database_module.init_db()
 
-    assert not _db_log_records(caplog, logging.WARNING), "有 revision 行时不应打告警"
-    infos = _db_log_records(caplog, logging.INFO)
+    assert not _db_log_records(db_log_records, logging.WARNING), "有 revision 行时不应打告警"
+    infos = _db_log_records(db_log_records, logging.INFO)
     assert any("由迁移管理" in r.getMessage() for r in infos), "应打一条迁移管理的 INFO"
     assert not await _sqlite_has_table(sqlite_engine, "chat_messages"), (
         "迁移建库同样跳过 create_all"
@@ -136,7 +189,7 @@ async def test_info_without_warning_when_alembic_version_has_revision(
 
 
 async def test_warns_when_alembic_version_table_is_missing(
-    sqlite_engine, monkeypatch, caplog
+    sqlite_engine, monkeypatch, db_log_records
 ):
     """非空 + 完全没有 alembic_version 表 → 跳过 + 漂移告警（判据的另一半）。"""
     monkeypatch.setattr(database_module, "engine", sqlite_engine)
@@ -145,10 +198,10 @@ async def test_warns_when_alembic_version_table_is_missing(
     async with sqlite_engine.begin() as conn:
         await conn.execute(text("DROP TABLE chat_messages"))
 
-    caplog.clear()
+    db_log_records.clear()
     await database_module.init_db()
 
-    warnings = _db_log_records(caplog, logging.WARNING)
+    warnings = _db_log_records(db_log_records, logging.WARNING)
     assert warnings, "没有 alembic_version 表：必须打漂移告警"
     msg = "".join(r.getMessage() for r in warnings)
     assert "没有 alembic_version 表" in msg
@@ -157,7 +210,7 @@ async def test_warns_when_alembic_version_table_is_missing(
 
 
 async def test_no_exception_and_warns_when_alembic_version_structure_changed(
-    sqlite_engine, monkeypatch, caplog
+    sqlite_engine, monkeypatch, db_log_records
 ):
     """表结构被改成非标准形态且 0 行：判据只做 COUNT(*)，不抛异常、仍打告警。
 
@@ -171,10 +224,10 @@ async def test_no_exception_and_warns_when_alembic_version_structure_changed(
         # 非标准结构：没有 version_num 列
         await conn.execute(text("CREATE TABLE alembic_version (whatever TEXT)"))
 
-    caplog.clear()
+    db_log_records.clear()
     await database_module.init_db()  # 不应抛异常
 
-    warnings = _db_log_records(caplog, logging.WARNING)
+    warnings = _db_log_records(db_log_records, logging.WARNING)
     assert warnings, "结构被改过但 0 行：仍必须打漂移告警"
     assert "没有 revision 记录" in "".join(r.getMessage() for r in warnings)
 

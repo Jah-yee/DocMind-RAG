@@ -292,10 +292,16 @@ jobs:
           alembic upgrade head
           python scripts/check_schema.py
 
-      - name: Run integration tests
+      # 整份 tests/ 一起跑，而不是只跑 tests/integration/（issue #160）：
+      # 「跨套件污染」只有把所有套件放进**同一个进程**才暴露——integration 进程内跑
+      # alembic env.py 时 fileConfig() 默认 disable_existing_loggers=True，会把既有
+      # logger 的 disabled 旗标置 True 并全进程残留，害得后面 unit 用例的日志断言集体
+      # 假红；拆成两个 job 跑时任何一边都看不见这种时序缺陷。该 job 只在 develop 推送
+      # （即合并）上运行，PR 门禁仍由 backend-tests 的 sqlite 快跑负责。
+      - name: Run full test suite (all suites in one process)
         working-directory: backend
         run: |
-          python -m pytest tests/integration/ -v --tb=short --cov=app --cov-report=xml --cov-report=term
+          python -m pytest tests/ -v --tb=short --cov=app --cov-report=xml --cov-report=term
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v7
