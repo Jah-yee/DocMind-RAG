@@ -18,6 +18,50 @@ const DEFAULT_RETRY_OPTIONS: Required<RetryOptions> = {
   onRetry: () => {}
 }
 
+// setTimeout 只能表达 32 位有符号整数毫秒（2^31 - 1）；更大的值会溢出成 1ms 并产生
+// TimeoutOverflowWarning（issue #140 的症状之一），因此解析结果封顶于此
+const MAX_TIMEOUT_MS = 2147483647
+
+/**
+ * 解析 Retry-After（RFC 9110 §10.2.3），返回应等待的毫秒数（有限、非负）。
+ *
+ * - delay-seconds（纯数字）：值是「等待秒数」，× 1000 即毫秒
+ * - HTTP-date：Date.parse 得到的是绝对时间戳，等待时长 = 距 now 的差值；已过去的日期 → 0
+ * - 其余无法解析的值 → 回退 fallbackMs
+ *
+ * 关键：不能先做 Date.parse 再兜底。ECMAScript 只强制支持 ISO 格式，其余为实现定义，
+ * V8 会把 "5" 当作「2001 年」、把 "-1"/"1.5"/"5." 解析成 2001 年前后的日期（issue #140 根因）。
+ * 因此必须先按纯数字判定 delay-seconds；无字母的残缺数字（"-1"、"1.5"、"5."）不交给
+ * Date.parse，直接回退——否则会经「已过去的时间戳」路径静默变成 0ms 等待。
+ */
+export function resolveRetryDelay(
+  retryAfter: string,
+  fallbackMs: number,
+  now: number = Date.now()
+): number {
+  const trimmed = String(retryAfter).trim()
+  let actualDelay: number
+
+  if (/^\d+$/.test(trimmed)) {
+    actualDelay = parseInt(trimmed, 10) * 1000
+  } else if (/[A-Za-z]/.test(trimmed)) {
+    // 合法的 HTTP-date（IMF-fixdate / RFC 850 / asctime / ISO）必含字母（月名、星期名或 T/Z）
+    const httpDateMs = Date.parse(trimmed)
+    actualDelay = Number.isNaN(httpDateMs) ? fallbackMs : Math.max(0, httpDateMs - now)
+  } else {
+    actualDelay = fallbackMs
+  }
+
+  // 封顶：避免超过 setTimeout 可表达的上限而溢出（见 MAX_TIMEOUT_MS 注释）
+  actualDelay = Math.min(actualDelay, MAX_TIMEOUT_MS)
+
+  // 末尾兜底：结果必须是有限非负数，否则回退默认延迟
+  if (!Number.isFinite(actualDelay) || actualDelay < 0) {
+    return fallbackMs
+  }
+  return actualDelay
+}
+
 export async function withRetry<T>(
   fn: () => Promise<T>,
   options: RetryOptions = {}
@@ -43,21 +87,10 @@ export async function withRetry<T>(
         const err = error as Record<string, unknown>
         const resp = err.response as Record<string, unknown> | undefined
         const retryAfter = (err.headers as Record<string, string>)?.['retry-after'] || (resp?.headers as Record<string, string>)?.['retry-after']
-        // Retry-After 可能是 HTTP-date（如 "Fri, 31 Dec 1999 23:59:59 GMT"）或秒数：
-        // 先 Date.parse 解析 HTTP-date（直接得毫秒），再 parseInt 秒数，都失败则回退默认延迟
-        let actualDelay = delay
-        if (retryAfter) {
-          const httpDateMs = Date.parse(retryAfter)
-          const seconds = parseInt(retryAfter, 10)
-          if (!Number.isNaN(httpDateMs)) {
-            actualDelay = httpDateMs
-          } else if (!Number.isNaN(seconds) && seconds >= 0) {
-            actualDelay = seconds * 1000
-          } else {
-            actualDelay = 1000
-          }
-        }
-        // 最终延迟必须是有限非负数字，否则回退默认延迟
+        // Retry-After（RFC 9110 §10.2.3）优先于指数退避；解析细节见 resolveRetryDelay
+        let actualDelay = retryAfter ? resolveRetryDelay(retryAfter, delay) : delay
+
+        // 末尾兜底：最终延迟必须是有限非负数，否则回退默认延迟
         if (!Number.isFinite(actualDelay) || actualDelay < 0) {
           actualDelay = 1000
         }
