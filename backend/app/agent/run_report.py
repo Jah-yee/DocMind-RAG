@@ -47,23 +47,41 @@ def build_run_report(ctx: ExecutionContext, final_output: str = "") -> dict[str,
     # be narrative, not observation.
     tool_calls = []
     for step in ctx.completed_steps:
-        tool_calls.append({
-            "step_id": step.step_id,
-            "description": step.description,
-            "tool": step.tool_used,
-            "status": step.status,
-            "duration_ms": round(step.duration_ms, 1),
-            "error": step.error,
-            "result_preview": step.result_summary[:200] if step.result_summary else "",
-        })
+        tool_calls.append(
+            {
+                "step_id": step.step_id,
+                "description": step.description,
+                "tool": step.tool_used,
+                "status": step.status,
+                "duration_ms": round(step.duration_ms, 1),
+                "error": step.error,
+                "result_preview": step.result_summary[:200] if step.result_summary else "",
+            }
+        )
 
     # Evaluation outcome — reflected in the reflect-phase decision the
-    # run already recorded (pass / retry / replan). We surface it, we do
-    # not act on it.
+    # run already recorded (pass / retry / replan). pass/retry are surfaced
+    # here; replan is now acted on by the loop itself (#106 §5a). The
+    # structured outcome fields below (fatal_issues / review_recommendation
+    # / clean_success, #106 §5b/§5c) are projected from ctx.artifacts, which
+    # the loop writes; this module itself still acts on nothing.
+    #
+    # §5b/§5c 语义：clean_success=False 表示本次 run 不得被呈现为一次干净的
+    # 成功 —— 质检有 fatal_issues（硬性失败）或对抗审查判定 reject。
+    # revise（建议修改）与质检的 C 档同级：只记录/暴露，不翻转 clean_success。
+    qg_artifact = ctx.artifacts.get("quality_gate") or {}
+    review_artifact = ctx.artifacts.get("review") or {}
+    fatal_issues = list(qg_artifact.get("fatal_issues") or [])
+    review_recommendation = review_artifact.get("recommendation")
+    clean_success = not fatal_issues and review_recommendation != "reject"
+
     evaluation = {
         "reflect_decisions": reflect_reasons or ["(no reflection recorded)"],
         "failures": ctx.failures or [],
         "grade_hint": _grade_hint(ctx),
+        "fatal_issues": fatal_issues,
+        "review_recommendation": review_recommendation,
+        "clean_success": clean_success,
     }
 
     return {
@@ -115,7 +133,9 @@ def render_run_report_text(report: dict[str, Any]) -> str:
     lines.append("")
     lines.append("## Steps")
     for s in report["steps"]:
-        lines.append(f"  - [{s['status']}] {s['description']} (tool={s['tool']}, {s['duration_ms']}ms)")
+        lines.append(
+            f"  - [{s['status']}] {s['description']} (tool={s['tool']}, {s['duration_ms']}ms)"
+        )
     lines.append("")
     lines.append("## Tool calls")
     for t in report["tool_calls"]:
@@ -127,6 +147,11 @@ def render_run_report_text(report: dict[str, Any]) -> str:
     lines.append("## Evaluation")
     ev = report["evaluation"]
     lines.append(f"  grade_hint: {ev['grade_hint']}")
+    lines.append(f"  clean_success: {ev['clean_success']}")
+    if ev["review_recommendation"]:
+        lines.append(f"  review_recommendation: {ev['review_recommendation']}")
+    for issue in ev["fatal_issues"]:
+        lines.append(f"  FATAL: {issue}")
     for f in ev["failures"]:
         lines.append(f"  FAILURE: {f}")
     for r in ev["reflect_decisions"]:

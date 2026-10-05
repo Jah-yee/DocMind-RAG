@@ -99,6 +99,7 @@ class PlanStep:
         retry_strategy    — "auto_retry" | "ask_user" | "skip" (failure behaviour)
         fallback_tool     — alternative tool if the primary tool_hint fails
     """
+
     id: str
     description: str
     dependencies: list[str] = field(default_factory=list)
@@ -110,14 +111,15 @@ class PlanStep:
 
     # ── v1 semantic-aware fields ──
     parallel_group: int | None = None  # same number = can parallelize
-    risk_level: str = "low"            # low | medium | high
-    retry_strategy: str = "auto_retry" # auto_retry | ask_user | skip
-    fallback_tool: str | None = None   # alternative tool
+    risk_level: str = "low"  # low | medium | high
+    retry_strategy: str = "auto_retry"  # auto_retry | ask_user | skip
+    fallback_tool: str | None = None  # alternative tool
 
 
 @dataclass
 class Plan:
     """A structured execution plan."""
+
     id: str
     goal: str
     reasoning: str = ""
@@ -169,8 +171,15 @@ class Planner:
         history: list[dict[str, str]] | None = None,
         memory_context: str = "",
         ctx: Any = None,  # ExecutionContext (avoid circular import)
+        replan_feedback: str = "",
     ) -> AsyncGenerator[AgentEvent, Plan | None]:
         """Generate a plan, yielding thinking events as reasoning streams.
+
+        Args:
+            replan_feedback: 反思判定 replan 时携带的缺口/质量问题文本
+                （issue #106 §5a）。非空表示这是一次**重新规划**：规则模板
+                只会原样复用上一版计划、修不了缺口，因此跳过模板直接走 LLM
+                规划，并把反馈注入提示词。
 
         Yields: thinking events during plan generation
         Sends back: Plan object when complete (via generator return)
@@ -183,6 +192,7 @@ class Planner:
         span = None
         try:
             from app.agent.observability import get_langfuse
+
             lf = get_langfuse()
             if lf:
                 span = lf.span(name="planning", input={"query": query, "plan_id": plan_id})
@@ -196,23 +206,40 @@ class Planner:
         # Experiments 001-003 proved the LLM-based Planner will not decompose
         # tasks (avg_steps ≈ 1).  When structured planning is enabled, the
         # system classifies the query and builds a template plan directly.
-        structured_plan = self._try_structured_planning(plan_id, query)
+        # 重新规划时跳过模板：同一 query 分类出的模板与上一版完全相同，
+        # 复制一份一模一样的计划无法回应反思指出的缺口。
+        structured_plan = None if replan_feedback else self._try_structured_planning(plan_id, query)
         if structured_plan:
             self._validate_dag(structured_plan)
-            yield AgentEvent(type="plan_start", plan_id=plan_id, content="分析任务类型，制定执行计划...")
+            yield AgentEvent(
+                type="plan_start", plan_id=plan_id, content="分析任务类型，制定执行计划..."
+            )
             for step in structured_plan.steps:
-                yield AgentEvent(type="plan_step", plan_id=plan_id, plan_step_id=step.id,
-                                 content=step.description, dependencies=step.dependencies,
-                                 tool_hint=step.tool_hint or "", plan_progress=0.0,
-                                 parallel_group=step.parallel_group,
-                                 risk_level=step.risk_level,
-                                 retry_strategy=step.retry_strategy,
-                                 fallback_tool=step.fallback_tool)
+                yield AgentEvent(
+                    type="plan_step",
+                    plan_id=plan_id,
+                    plan_step_id=step.id,
+                    content=step.description,
+                    dependencies=step.dependencies,
+                    tool_hint=step.tool_hint or "",
+                    plan_progress=0.0,
+                    parallel_group=step.parallel_group,
+                    risk_level=step.risk_level,
+                    retry_strategy=step.retry_strategy,
+                    fallback_tool=step.fallback_tool,
+                )
                 await asyncio.sleep(0.005)
-            yield AgentEvent(type="plan_complete", plan_id=plan_id, plan_goal=structured_plan.goal,
-                             content=f"计划已生成: {structured_plan.total_steps} 个步骤", plan_progress=0.0)
+            yield AgentEvent(
+                type="plan_complete",
+                plan_id=plan_id,
+                plan_goal=structured_plan.goal,
+                content=f"计划已生成: {structured_plan.total_steps} 个步骤",
+                plan_progress=0.0,
+            )
             if ctx:
-                ctx.record_decision("plan", "structured", f"Generated {len(structured_plan.steps)} steps")
+                ctx.record_decision(
+                    "plan", "structured", f"Generated {len(structured_plan.steps)} steps"
+                )
             AGENT_PLANNING_LATENCY.observe(time.time() - planning_start)
             return
 
@@ -220,7 +247,9 @@ class Planner:
         mode = getattr(self.config, "planning_mode", "normal")
         if mode == "coarse":
             max_steps = 1
-            granularity_instruction = "\n\n**重要**: 请一步完成，不要拆分步骤。直接将用户需求作为一个步骤输出。"
+            granularity_instruction = (
+                "\n\n**重要**: 请一步完成，不要拆分步骤。直接将用户需求作为一个步骤输出。"
+            )
         elif mode == "fine":
             max_steps = 12
             granularity_instruction = (
@@ -245,12 +274,25 @@ class Planner:
         if self.config.enable_experience:
             try:
                 from app.agent.experience import get_experience_store
+
                 store = get_experience_store()
                 exp_context = await store.format_for_planner(query, top_k=3)
                 if exp_context:
                     system_prompt += f"\n\n{exp_context}"
             except Exception:
                 pass
+
+        # ── Re-planning feedback (issue #106 §5a) ──
+        # 反思判定 replan 时注入：上一版计划哪里不行、缺什么。让 LLM 据此
+        # 修正计划，而不是重复上一版。
+        if replan_feedback:
+            system_prompt += (
+                "\n\n## 反思反馈（重新规划的依据）\n"
+                "上一轮执行被反思判定为 **计划需要重新制定**，反馈如下：\n"
+                f"{replan_feedback}\n"
+                "\n请针对以上反馈重新制定计划：补齐缺失的信息、更换无效的工具、"
+                "调整步骤拆分。用户目标没有变化；不要原样重复上一版计划。"
+            )
 
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": system_prompt},
@@ -332,7 +374,9 @@ class Planner:
             self._validate_dag(plan)
 
             if ctx:
-                ctx.record_decision("plan", "complete", f"Generated plan with {len(plan.steps)} steps")
+                ctx.record_decision(
+                    "plan", "complete", f"Generated plan with {len(plan.steps)} steps"
+                )
 
             # Yield plan steps
             for step in plan.steps:
@@ -403,21 +447,60 @@ class Planner:
     # A query is classified into the first matching type.
 
     # Comparison: must have BOTH a comparison word AND multi-entity indicator
-    _CMP_WORDS = ["对比", "比较", "compare", "vs", "versus", "差异", "区别",
-                   "不同之处", "异同", "孰优"]
-    _CMP_ENTITIES = ["和", "与", "、", "两家", "三家", "多个", "分别",
-                      "双方", "各方"]
+    _CMP_WORDS = [
+        "对比",
+        "比较",
+        "compare",
+        "vs",
+        "versus",
+        "差异",
+        "区别",
+        "不同之处",
+        "异同",
+        "孰优",
+    ]
+    _CMP_ENTITIES = ["和", "与", "、", "两家", "三家", "多个", "分别", "双方", "各方"]
 
     # Analysis: typically uses a named framework
-    _ANALYSIS_WORDS = ["swot", "pest", "杜邦", "框架分析", "财务健康",
-                        "健康评估", "风险评估", "合同风险"]
+    _ANALYSIS_WORDS = [
+        "swot",
+        "pest",
+        "杜邦",
+        "框架分析",
+        "财务健康",
+        "健康评估",
+        "风险评估",
+        "合同风险",
+    ]
 
     # Research: broader — tasks that need gather → extract → synthesize
-    _RESEARCH_WORDS = ["总结", "综述", "概述", "概括", "归纳", "研究", "调研",
-                        "趋势", "发展", "行业", "市场", "报告", "分析报告",
-                        "预测", "前景", "竞争格局", "市场份额",
-                        "政策", "变化", "影响", "融资", "新闻",
-                        "消费者", "规模", "竞争"]
+    _RESEARCH_WORDS = [
+        "总结",
+        "综述",
+        "概述",
+        "概括",
+        "归纳",
+        "研究",
+        "调研",
+        "趋势",
+        "发展",
+        "行业",
+        "市场",
+        "报告",
+        "分析报告",
+        "预测",
+        "前景",
+        "竞争格局",
+        "市场份额",
+        "政策",
+        "变化",
+        "影响",
+        "融资",
+        "新闻",
+        "消费者",
+        "规模",
+        "竞争",
+    ]
 
     def _classify_task_type(self, query: str) -> str | None:
         """Classify query into known task types for template-based planning.
@@ -471,12 +554,30 @@ class Planner:
     def _build_comparison_plan(self, plan_id: str, query: str) -> Plan:
         """Template: parallel entity research → compare → synthesize."""
         import re as _re
+
         # Extract named entities: split by 和/与/、, then strip known prefixes
-        parts = _re.split(r'\s*(?:和|与|、|vs\.?|versus)\s*', query)
-        strip_words = (self._CMP_WORDS + self._CMP_ENTITIES
-                       + ["搜索", "找", "查", "search", "find", "分析",
-                          "两份", "三份", "两家", "三家", "同行业",
-                          "的", "财务表现", "相关信息", "信息"])
+        parts = _re.split(r"\s*(?:和|与|、|vs\.?|versus)\s*", query)
+        strip_words = (
+            self._CMP_WORDS
+            + self._CMP_ENTITIES
+            + [
+                "搜索",
+                "找",
+                "查",
+                "search",
+                "find",
+                "分析",
+                "两份",
+                "三份",
+                "两家",
+                "三家",
+                "同行业",
+                "的",
+                "财务表现",
+                "相关信息",
+                "信息",
+            ]
+        )
         entities = []
         for p in parts:
             p = p.strip()
@@ -486,9 +587,9 @@ class Planner:
             for kw in strip_words:
                 kw_lower = kw.lower()
                 while p.lower().startswith(kw_lower):
-                    p = p[len(kw):].strip()
+                    p = p[len(kw) :].strip()
                 while p.lower().endswith(kw_lower):
-                    p = p[:-len(kw)].strip()
+                    p = p[: -len(kw)].strip()
             if p and len(p) >= 2 and p not in entities:  # min 2 chars to be a valid entity
                 entities.append(p)
         # Remove duplicates while preserving order
@@ -516,29 +617,37 @@ class Planner:
 
         steps: list[PlanStep] = []
         for i, entity in enumerate(entities):
-            steps.append(PlanStep(
-                id=f"s{i + 1}",
-                description=f"研究{entity}的相关信息，提取关键指标",
-                dependencies=[],
-                tool_hint="search_knowledge_base",
-                parallel_group=1,
-                risk_level="low", retry_strategy="auto_retry",
-            ))
+            steps.append(
+                PlanStep(
+                    id=f"s{i + 1}",
+                    description=f"研究{entity}的相关信息，提取关键指标",
+                    dependencies=[],
+                    tool_hint="search_knowledge_base",
+                    parallel_group=1,
+                    risk_level="low",
+                    retry_strategy="auto_retry",
+                )
+            )
 
         # Compare step
         all_search = [s.id for s in steps]
-        steps.append(PlanStep(
-            id=f"s{len(entities) + 1}",
-            description=f"对比各实体的关键信息，找出差异和共性: {query[:50]}",
-            dependencies=all_search,
-            tool_hint="cross_document_analysis",
-            risk_level="low", retry_strategy="auto_retry",
-        ))
+        steps.append(
+            PlanStep(
+                id=f"s{len(entities) + 1}",
+                description=f"对比各实体的关键信息，找出差异和共性: {query[:50]}",
+                dependencies=all_search,
+                tool_hint="cross_document_analysis",
+                risk_level="low",
+                retry_strategy="auto_retry",
+            )
+        )
 
         return Plan(
-            id=plan_id, goal=query[:80],
+            id=plan_id,
+            goal=query[:80],
             reasoning=f"对比任务: {len(entities)} 个实体并行搜索 → 综合对比",
-            steps=steps)
+            steps=steps,
+        )
 
     # ── Template: analysis ────────────────────────────────────────────
     #  Collect Data (parallel) → Apply Framework → Generate Conclusions
@@ -556,27 +665,38 @@ class Planner:
             framework_name = "杜邦"
 
         steps = [
-            PlanStep(id="s1",
-                     description=f"搜索相关信息: {query[:50]}",
-                     dependencies=[],
-                     tool_hint="search_knowledge_base",
-                     parallel_group=1,
-                     risk_level="low", retry_strategy="auto_retry"),
-            PlanStep(id="s2",
-                     description=f"用{framework_name}框架进行分析: {query[:50]}",
-                     dependencies=["s1"],
-                     tool_hint="extract_insights",
-                     risk_level="low", retry_strategy="auto_retry"),
-            PlanStep(id="s3",
-                     description=f"生成{framework_name}分析结论: {query[:50]}",
-                     dependencies=["s2"],
-                     tool_hint="generate_report",
-                     risk_level="low", retry_strategy="auto_retry"),
+            PlanStep(
+                id="s1",
+                description=f"搜索相关信息: {query[:50]}",
+                dependencies=[],
+                tool_hint="search_knowledge_base",
+                parallel_group=1,
+                risk_level="low",
+                retry_strategy="auto_retry",
+            ),
+            PlanStep(
+                id="s2",
+                description=f"用{framework_name}框架进行分析: {query[:50]}",
+                dependencies=["s1"],
+                tool_hint="extract_insights",
+                risk_level="low",
+                retry_strategy="auto_retry",
+            ),
+            PlanStep(
+                id="s3",
+                description=f"生成{framework_name}分析结论: {query[:50]}",
+                dependencies=["s2"],
+                tool_hint="generate_report",
+                risk_level="low",
+                retry_strategy="auto_retry",
+            ),
         ]
         return Plan(
-            id=plan_id, goal=query[:80],
+            id=plan_id,
+            goal=query[:80],
             reasoning=f"分析任务: 搜索 → {framework_name}分析 → 生成结论",
-            steps=steps)
+            steps=steps,
+        )
 
     # ── Template: research ────────────────────────────────────────────
     #  Gather Sources → Extract Facts → Synthesize
@@ -585,41 +705,53 @@ class Planner:
     def _build_research_plan(self, plan_id: str, query: str) -> Plan:
         """Template: gather sources → extract → synthesize."""
         steps = [
-            PlanStep(id="s1",
-                     description=f"搜集相关资料: {query[:50]}",
-                     dependencies=[],
-                     tool_hint="search_knowledge_base",
-                     parallel_group=1,
-                     risk_level="low", retry_strategy="auto_retry"),
-            PlanStep(id="s2",
-                     description=f"提取关键事实和数据: {query[:50]}",
-                     dependencies=["s1"],
-                     tool_hint="extract_insights",
-                     risk_level="low", retry_strategy="auto_retry"),
-            PlanStep(id="s3",
-                     description=f"综合归纳研究结果: {query[:50]}",
-                     dependencies=["s2"],
-                     tool_hint="summarize_document",
-                     risk_level="low", retry_strategy="auto_retry"),
+            PlanStep(
+                id="s1",
+                description=f"搜集相关资料: {query[:50]}",
+                dependencies=[],
+                tool_hint="search_knowledge_base",
+                parallel_group=1,
+                risk_level="low",
+                retry_strategy="auto_retry",
+            ),
+            PlanStep(
+                id="s2",
+                description=f"提取关键事实和数据: {query[:50]}",
+                dependencies=["s1"],
+                tool_hint="extract_insights",
+                risk_level="low",
+                retry_strategy="auto_retry",
+            ),
+            PlanStep(
+                id="s3",
+                description=f"综合归纳研究结果: {query[:50]}",
+                dependencies=["s2"],
+                tool_hint="summarize_document",
+                risk_level="low",
+                retry_strategy="auto_retry",
+            ),
         ]
 
         # For queries that explicitly mention "对比趋势" or "变化",
         # add a trend-analysis step between extract and synthesize
         if any(kw in query.lower() for kw in ["趋势", "变化", "对比", "多年", "三年"]):
-            steps.insert(2, PlanStep(
-                id="s2b",
-                description=f"分析跨期趋势和变化: {query[:50]}",
-                dependencies=["s2"],
-                tool_hint="cross_document_analysis",
-                risk_level="low", retry_strategy="auto_retry",
-            ))
+            steps.insert(
+                2,
+                PlanStep(
+                    id="s2b",
+                    description=f"分析跨期趋势和变化: {query[:50]}",
+                    dependencies=["s2"],
+                    tool_hint="cross_document_analysis",
+                    risk_level="low",
+                    retry_strategy="auto_retry",
+                ),
+            )
             # Re-wire dependency: trend → synthesize
             steps[-1].dependencies = ["s2b"]
 
         return Plan(
-            id=plan_id, goal=query[:80],
-            reasoning="研究任务: 搜集 → 提取 → 归纳",
-            steps=steps)
+            id=plan_id, goal=query[:80], reasoning="研究任务: 搜集 → 提取 → 归纳", steps=steps
+        )
 
     def _build_tools_description(self) -> str:
         """Build a semantic-aware tool list for the planning prompt.
@@ -639,6 +771,7 @@ class Planner:
 
         # Group by category
         from collections import defaultdict
+
         groups: dict[str, list] = defaultdict(list)
         for t in active:
             cat = t.category or "general"
@@ -670,7 +803,7 @@ class Planner:
     def _extract_json(self, text: str) -> dict[str, Any]:
         """Extract JSON from LLM response, handling markdown code fences."""
         # Try to find JSON inside ```json ... ``` blocks
-        json_match = re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', text)
+        json_match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
         if json_match:
             try:
                 return json.loads(json_match.group(1))
@@ -685,7 +818,7 @@ class Planner:
 
         # Try to find { ... } spanning multiple lines
         try:
-            brace_match = re.search(r'\{[\s\S]*\}', text)
+            brace_match = re.search(r"\{[\s\S]*\}", text)
             if brace_match:
                 return json.loads(brace_match.group(0))
         except json.JSONDecodeError:
@@ -732,17 +865,19 @@ class Planner:
             if retry not in ("auto_retry", "ask_user", "skip"):
                 retry = "auto_retry"
 
-            steps.append(PlanStep(
-                id=sid,
-                description=s.get("description", f"步骤 {i + 1}"),
-                dependencies=s.get("dependencies", []) or [],
-                tool_hint=s.get("tool_hint") or None,
-                # v1 semantic-aware fields
-                parallel_group=s.get("parallel_group"),
-                risk_level=risk,
-                retry_strategy=retry,
-                fallback_tool=s.get("fallback_tool") or None,
-            ))
+            steps.append(
+                PlanStep(
+                    id=sid,
+                    description=s.get("description", f"步骤 {i + 1}"),
+                    dependencies=s.get("dependencies", []) or [],
+                    tool_hint=s.get("tool_hint") or None,
+                    # v1 semantic-aware fields
+                    parallel_group=s.get("parallel_group"),
+                    risk_level=risk,
+                    retry_strategy=retry,
+                    fallback_tool=s.get("fallback_tool") or None,
+                )
+            )
 
         return Plan(
             id=plan_id,
@@ -787,6 +922,7 @@ class Planner:
         """Persist plan to Redis for session recovery."""
         try:
             from app.core.redis import redis_client
+
             if not redis_client:
                 return
             key = f"agent:plan:{plan.id}"
@@ -821,6 +957,7 @@ class Planner:
         """Load a plan from Redis."""
         try:
             from app.core.redis import redis_client
+
             if not redis_client:
                 return None
             key = f"agent:plan:{plan_id}"
