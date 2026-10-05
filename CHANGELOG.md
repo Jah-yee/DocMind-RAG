@@ -5,6 +5,58 @@ All notable changes to DocMind will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.22.1-rc.1] - 2026-10-05
+
+> **预发布（pre-release）**。本版的主体是**依赖大版本升级与 CI 加固**，没有面向产品的新功能。
+> 之所以先走 RC 而不是直接标稳定：三个大版本里有**运行时依赖**（markdown-it、katex 渲染插件），
+> 而自动化测试只能证明「类型正确、能构建、单测通过」，**证明不了渲染效果**。
+> 确认无误后再标 1.22.1 稳定版。
+
+### Changed
+
+- **markdown-it 14 → 15**（运行时依赖）。破坏性变更只有一处：v15 起默认导出是
+  `MarkdownItCallable`（一个 `const`，为兼容不带 `new` 的旧写法而包了一层），
+  **只有值、没有类型含义**，`MarkdownIt` 作为类型改为仅具名导出。已去掉显式类型标注，
+  让 TS 从 `new` 的构造签名推断。**markdown 渲染效果建议实测确认。**
+- **换用 `@vscode/markdown-it-katex` 替代已停维护的 `markdown-it-katex`**。
+  后者有 high 级 XSS 公告 `GHSA-5ff8-jcf9-fw62`（影响全部版本、**无补丁版本**），
+  此前只能靠 DOMPurify 缓解 + 允许清单豁免。换成 VS Code 在用的维护分支后，
+  **漏洞从根上消失**，允许清单随之从两条减到一条。新包自带类型定义，
+  顺带删掉了手写的类型 shim 与那条为适配老包（它依赖 2017 年的 `katex ^0.6.0`）
+  而存在的 `overrides`。**数学公式渲染效果建议实测确认。**
+- **vitest 4 → 5**（含 `@vitest/coverage-v8` 5、`@types/node` 20 → 22）。
+  这三个必须一起升：`coverage-v8@5` 的 peer 要求 `vitest@5`，`vitest@5` 要求
+  `@types/node >= 22`。`@types/node` 的跳跃改变 Node API 类型签名，已用 vue-tsc 全量确认。
+- **pytest 8 → 9**。仓库约束原本钉在 `<9.0`，而修复 medium 级 tmpdir 漏洞
+  （`GHSA-6w46-j5rx-g56g`）必须跨大版本。已实测 612 个测试在 pytest 9 下全部通过。
+- **依赖错位修复**：`markdown-it` 曾被误置于 `devDependencies`（运行时依赖）。
+  当前 CI 下不暴露（`npm ci` 装全量 + Vite 构建时打包），但任何 `npm ci --omit=dev`
+  的部署都会挂。已移回 `dependencies`。
+
+### Added
+
+- **PR 自动截图**（`screenshots.yml`）：改动 `frontend/**` 的 PR 会自动抓取登录页 /
+  仪表盘 / 对话页并发到 PR 评论。脚本自带 dev server 与 API 打桩，**不需要后端**；
+  图片托管在独立的 `screenshots` 分支（不占用 PR 正文、不留悬空 blob 链接、只保留最近 20 次）。
+- **E2E 冒烟**（`frontend-e2e` job，4 条用例）：未登录跳转 / 登录页渲染 / 空表单校验 /
+  登录成功全流程。纯前端 + `page.route` 打桩，不需要后端与数据库。
+  做成**独立并行 job** 而非塞进前端单测 —— 后者会把关键路径从约 78 秒推到约 180 秒。
+- **抓图断言**：截图脚本现在会比较当前 pathname 与目标路径，被重定向（拍到登录页）即失败。
+
+### Security
+
+- **Dependency Review 的 scope 收紧到 `runtime + development`**。默认只含 `runtime`，
+  而本仓库 4/6 个 high 级漏洞源自 `devDependency`（eslint 工具链）——
+  按默认配置，最该被拦的那一类恰好不在门禁范围内。
+- **`fail-on-severity: high` 阻断经实测验证**：加入已知有漏洞的运行时依赖时该 job 确实失败。
+
+### Notes
+
+- 当前允许清单仅剩一条：`braces <= 3.0.3` 的 DoS（**最新版即受影响版，官方无修复**，
+  且仅在构建/lint 期使用）。豁免理由写在配置注释与 `docs/ci-charter.md` 里。
+- 根因链：`main` 落后 `develop` 曾导致 Dependabot 显示 92 个告警而实际只有 6 个 ——
+  告警基于默认分支计算。本版发布后该偏差消除。
+
 ## [1.22.0] - 2026-10-05
 
 ### Security
