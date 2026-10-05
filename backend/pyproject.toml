@@ -78,6 +78,7 @@ filterwarnings = [
 ]
 markers = [
     "unit: Unit tests (no external deps)",
+    "api: API tests (TestClient + dependency_overrides, no real services)",
     "integration: Integration tests (need DB/ES/Redis)",
     "slow: Slow tests (deselect with -m 'not slow')",
 ]
@@ -86,7 +87,7 @@ markers = [
 # 这里**有意不设** fail_under。
 #
 # 覆盖率下限是一个**针对特定测试子集**的判断，不是一个全局属性：ci-fast 的 PR 门禁跑
-# unit + behavior + 两个集成文件（实测约 44%），而 integration job 只跑 tests/integration/
+# unit + api + behavior（实测约 48%），而 integration job 只跑 tests/integration/
 # （实测约 32%）—— 同一个 42% 的下限在前者合理、在后者必然误报。
 #
 # 设成全局的下场已经发生过一次：integration job 首次运行就因 "total of 32 is less than

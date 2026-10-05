@@ -92,7 +92,7 @@ jobs:
       # 覆盖率下限**写在这条命令上而不是 pyproject.toml 里**：下限是"针对某个测试子集"的
       # 判断，不是仓库的全局属性。integration job 只跑 tests/integration/（约 32%），
       # 套用同一个 42% 会把一次 179 个测试全过的运行报成失败 —— 这已经真实发生过。
-      - name: Run fast tests (unit + behavior + API security regressions)
+      - name: Run fast tests (unit + api + behavior)
         working-directory: backend
         env:
           COVERAGE: ${{ matrix.coverage }}
@@ -100,7 +100,7 @@ jobs:
           # 用 bash 数组而不是字符串变量：`pytest $ARGS` 会被 shellcheck 判为
           # SC2086（未加引号的变量会做词分割/通配），而 `pytest "$ARGS"` 又会把
           # 整串当成单个参数、pytest 找不到路径。数组是唯一同时满足两者的写法。
-          ARGS=(tests/unit/ tests/behavior/ tests/integration/test_security_regressions.py tests/integration/test_api_auth.py -v --tb=short)
+          ARGS=(tests/unit/ tests/api/ tests/behavior/ -v --tb=short)
           if [ "$COVERAGE" = "true" ]; then
             python -m pytest "${ARGS[@]}" --cov=app --cov-report=xml --cov-report=term --cov-fail-under=42
           else
