@@ -17,7 +17,7 @@
 - **CI Pass**：上述四者的聚合门禁（把并行结果收敛成单一结论）
 
 `ci-hygiene.yml`（仅 PR）：commitlint（只查本 PR 新增提交）、PR labeler、conflict-markers。
-`dependency-review.yml`（仅 PR）：只审查本 PR **新增**依赖的已知漏洞，high+ 阻断。
+`dependency-review.yml`（仅 PR）：只审查本 PR **新增**依赖的已知漏洞，high+ 阻断；**scope 含 runtime + development**（默认只含 runtime，而本仓库 4/6 个 high 源自 devDependency）。
 `codeql.yml`：push / PR 都跑（security-extended，python + js/ts），周一 schedule 补扫。
 `docker-build.yml`：仅当容器相关文件（Dockerfile / requirements / compose / deploy…）变化时才构建镜像。
 `ci-nightly.yml`（每周一 02:00 UTC + 手动）：backend integration 的**环境漂移检查**（代码没变时上游依赖 / runner 镜像变化也能被发现）+ bandit / 依赖审计。
@@ -59,7 +59,7 @@ integration 是 `ci-fast.yml` 里的 job：只在 **push 到 develop**、且 bac
 | bandit (medium+) | 代码内安全问题 | PR + nightly | 是 |
 | bandit (low) | 同上，低信噪比 | nightly | 仅报告 |
 | CodeQL（security-extended） | 语义级漏洞（数据流） | PR / push + 周一 | 是 |
-| Dependency Review | 本 PR **新增**依赖的已知漏洞 | PR | high+ 阻断 |
+| Dependency Review | 本 PR **新增**依赖的已知漏洞（scope: runtime + development） | PR | high+ 阻断 |
 | Dependabot | 存量依赖更新与漏洞 | 持续 | 走它自己的 PR |
 | pip-audit / npm audit | 存量依赖树审计 | nightly | 仅报告（advisory） |
 | conflict-markers / commitlint | 冲突标记、提交信息 | PR | 是 |
