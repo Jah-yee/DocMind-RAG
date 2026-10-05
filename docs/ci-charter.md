@@ -60,6 +60,7 @@ integration 是 `ci-fast.yml` 里的 job：只在 **push 到 develop**、且 bac
 | bandit (low) | 同上，低信噪比 | nightly | 仅报告 |
 | CodeQL（security-extended） | 语义级漏洞（数据流） | PR / push + 周一 | 是 |
 | Dependency Review | 本 PR **新增**依赖的已知漏洞（scope: runtime + development） | PR | high+ 阻断 |
+| ^ 例外 | 两个**无补丁版本**的公告经 `allow-ghsas` 豁免：`braces` 的 DoS（最新版即受影响版，官方无修复）、`markdown-it-katex` 的 XSS（包已停维护，且输出经 DOMPurify 缓解）。豁免必须在配置里写明理由。 | — | — |
 | Dependabot | 存量依赖更新与漏洞 | 持续 | 走它自己的 PR |
 | pip-audit / npm audit | 存量依赖树审计 | nightly | 仅报告（advisory） |
 | conflict-markers / commitlint | 冲突标记、提交信息 | PR | 是 |
