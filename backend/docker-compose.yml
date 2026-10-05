@@ -59,6 +59,9 @@ services:
       - ELASTICSEARCH_HOSTS=["http://docmind-elasticsearch:9200"]
       - MINIO_ENDPOINT=docmind-minio:9000
       - KAFKA_BOOTSTRAP_SERVERS=docmind-kafka:29092
+      # 存活性心跳（issue #156）：消费循环刷新该文件，健康检查读它的新鲜度
+      - WORKER_HEARTBEAT_FILE=/tmp/docmind_worker_heartbeat
+      - WORKER_HEARTBEAT_MAX_AGE_SECONDS=90
     depends_on:
       mysql:
         condition: service_healthy
@@ -70,6 +73,17 @@ services:
         condition: service_healthy
       kafka:
         condition: service_started
+    healthcheck:
+      # worker 不监听任何端口，复用镜像里探 :8000 的 HEALTHCHECK 会永远
+      # unhealthy（issue #156）。这里改为真实存活性信号：消费循环每次 Kafka
+      # 轮询（空闲时也按 POLL_TIMEOUT_MS 返回）刷新 /tmp 心跳文件，
+      # worker_healthcheck.py 检查 mtime 是否过期——进程被冻结 / 消费循环
+      # 卡死时心跳停止刷新，容器即判为 unhealthy。
+      test: ["CMD", "python", "worker_healthcheck.py"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
     networks:
       - docmind-network
     restart: unless-stopped

@@ -7,6 +7,7 @@ stays consistent.
 
 import logging
 import uuid
+from collections.abc import Callable
 from datetime import datetime
 
 from sqlalchemy import delete, select
@@ -27,6 +28,10 @@ logger = logging.getLogger(__name__)
 
 # 文档处理并发锁：Redis SETNX + TTL 兜底，防止同一文档被并发重复处理
 _LOCK_TTL_SECONDS = 600
+
+
+def _noop() -> None:
+    """默认进度回调（不关心进度的调用方）。"""
 
 
 class DocumentProcessor:
@@ -67,12 +72,21 @@ class DocumentProcessor:
                 "[DOC_PROC] Redis lock release failed (TTL will expire): %s", e
             )
 
-    async def process(self, document_id: str, job_id: int | None = None) -> bool:
+    async def process(
+        self,
+        document_id: str,
+        job_id: int | None = None,
+        on_progress: Callable[[], None] | None = None,
+    ) -> bool:
         """Run the full document pipeline once.
 
         Old chunks and ES entries are replaced only after a successful parse, so a
         retry never leaves partial duplicates behind.
+
+        ``on_progress``（可选）在每个阶段边界各调用一次：worker 用它刷新心跳，
+        避免单篇大文档的长耗时解析/向量化被健康检查误判为"卡死"（issue #156）。
         """
+        notify = on_progress or _noop
         logger.info("[DOC_PROC] start document_id=%s job_id=%s", document_id, job_id)
         lock_acquired = await self._acquire_processing_lock(document_id)
         if lock_acquired is False:
@@ -82,6 +96,7 @@ class DocumentProcessor:
                 job_id,
             )
             return False
+        notify()
         try:
             doc = await self._load_and_mark_parsing(document_id, job_id)
             if doc is None:
@@ -90,6 +105,7 @@ class DocumentProcessor:
             parse_result = await self.parser.parse_document(
                 doc.file_path, str(doc.organization_id)
             )
+            notify()
             chunks_data = parse_result.get("chunks", [])
             if not chunks_data:
                 raise ValueError("文件解析后无内容，可能为空文件或解析失败。")
@@ -97,13 +113,16 @@ class DocumentProcessor:
             embeddings = await self._get_embeddings(
                 [c["chunk_text"] for c in chunks_data]
             )
+            notify()
             if len(embeddings) != len(chunks_data):
                 raise ValueError(
                     f"向量生成数量与文本块数量不匹配: {len(embeddings)} vs {len(chunks_data)}"
                 )
 
             await self._replace_document_state(doc, chunks_data, embeddings)
+            notify()
             await self._mark_success(document_id, chunks_data, job_id)
+            notify()
             logger.info(
                 "[DOC_PROC] done document_id=%s chunks=%d", document_id, len(chunks_data)
             )
