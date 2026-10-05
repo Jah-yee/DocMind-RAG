@@ -105,6 +105,8 @@ services:
     container_name: docmind-redis
     # REDIS_PASSWORD（可选）：在运行 compose 的 shell 环境或项目 .env 中设置——这是 Compose 插值
     # 的来源（.env.docker 只作为 backend/worker 的 env_file 注入容器，不参与插值，已实测 2026-10-05）。
+    # ⚠️ 启用密码时两处都要设：服务端用上述来源，应用侧 backend/worker 用 .env.docker；只设 .env.docker
+    # 服务端仍无密码（nopass 用户接受任意 AUTH，应用能连上，但并未受密码保护）。
     # 未设置时以无密码模式运行（仅绑定 127.0.0.1）。
     # ⚠️ 不能写成 `command: redis-server --requirepass ${REDIS_PASSWORD:-}`：
     # 空值时 Compose 分词会把空参数整个丢掉，命令变成 ["redis-server","--requirepass"]（缺参），
