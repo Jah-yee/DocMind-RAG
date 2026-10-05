@@ -18,6 +18,8 @@ export default defineConfig({
       reporter: ['text', 'json', 'html'],
       exclude: ['node_modules/', 'src/main.ts', '**/*.d.ts'],
     },
-    setupFiles: [],
+    // jsdom 缺 window.matchMedia 等少量浏览器 API，产品代码里合法使用它们，
+    // 补在测试侧（见 src/test-setup.ts）
+    setupFiles: ['./src/test-setup.ts'],
   },
 })

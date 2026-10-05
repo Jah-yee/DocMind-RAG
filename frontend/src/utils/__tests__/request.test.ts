@@ -1,0 +1,152 @@
+/**
+ * request.ts 的单元测试。
+ *
+ * issue #105 点名要测的四块：token 注入、401 静默刷新、队列重放、去重 toast。
+ * 其中**队列重放**最容易出错也最值得测 —— 它决定了「刷新期间并发发出的请求
+ * 会不会被丢掉」。
+ *
+ * 测法：给 request 实例换一个自定义 adapter 来截获每次请求的 config，
+ * 用 spy 替换 refresh 调用。走的是公开 API，不碰内部实现。
+ */
+import axios from 'axios'
+import { createPinia, setActivePinia } from 'pinia'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+
+import request, { clearDefaultAuth } from '../request'
+
+/** 每次请求看到的 config（按顺序） */
+let seen: Array<Record<string, any>> = []
+/** 让 adapter 按调用次数返回不同结果 */
+let responses: Array<{ status: number; data?: unknown }> = []
+
+function installAdapter() {
+  request.defaults.adapter = (async (config: any) => {
+    seen.push({ url: config.url, headers: config.headers })
+    const next = responses.shift() ?? { status: 200, data: { ok: true } }
+    const response = { data: next.data, status: next.status, statusText: '', headers: {}, config }
+    // axios 的 adapter 需要在非 2xx 时自行 reject，才能触发响应拦截器的错误分支
+    if (next.status >= 200 && next.status < 300) return response
+    const err: any = new Error(`Request failed with status code ${next.status}`)
+    err.config = config
+    err.response = response
+    err.isAxiosError = true
+    throw err
+  }) as any
+}
+
+function authHeaderOf(entry: Record<string, any>): string | undefined {
+  const h = entry.headers ?? {}
+  return h.Authorization ?? h.authorization
+}
+
+beforeEach(() => {
+  setActivePinia(createPinia())
+  seen = []
+  responses = []
+  installAdapter()
+  localStorage.clear()
+  clearDefaultAuth()
+  vi.restoreAllMocks()
+})
+
+afterEach(() => {
+  vi.restoreAllMocks()
+})
+
+describe('请求拦截器 · token 注入', () => {
+  it('有 token 时带上 Authorization 头', async () => {
+    localStorage.setItem('docmind_token', 'tok-abc')
+
+    await request.get('/documents')
+
+    expect(authHeaderOf(seen[0])).toBe('Bearer tok-abc')
+  })
+
+  it('无 token 时不带 Authorization 头', async () => {
+    await request.get('/documents')
+
+    expect(authHeaderOf(seen[0])).toBeUndefined()
+  })
+
+  it('剔除历史脏数据里的包裹引号', async () => {
+    // 注释里写明「保留剥引号逻辑以兼容历史脏数据」
+    localStorage.setItem('docmind_token', '"tok-quoted"')
+
+    await request.get('/documents')
+
+    expect(authHeaderOf(seen[0])).toBe('Bearer tok-quoted')
+  })
+
+  it('每个请求都带 X-Request-ID', async () => {
+    await request.get('/documents')
+
+    const headers = seen[0].headers ?? {}
+    const rid = headers['X-Request-ID'] ?? headers['x-request-id']
+    expect(rid).toBeTruthy()
+  })
+})
+
+describe('401 · 静默刷新与重放', () => {
+  it('401 后用新 token 重试同一个请求', async () => {
+    localStorage.setItem('docmind_token', 'old-token')
+    localStorage.setItem('docmind_refresh_token', 'refresh-ok')
+
+    // 第一次 401，重试时 200
+    responses = [{ status: 401 }, { status: 200, data: { ok: true } }]
+    vi.spyOn(axios, 'post').mockResolvedValue({
+      data: { data: { access_token: 'new-token', expires_in: 3600 } },
+    } as any)
+
+    const resp = await request.get('/documents')
+
+    expect(resp.status).toBe(200)
+    expect(seen).toHaveLength(2)
+    expect(authHeaderOf(seen[1])).toBe('Bearer new-token')
+    expect(localStorage.getItem('docmind_token')).toBe('new-token')
+  })
+
+  it('刷新失败时不再重试，并清掉登录态', async () => {
+    localStorage.setItem('docmind_token', 'old-token')
+    localStorage.setItem('docmind_refresh_token', 'refresh-bad')
+
+    responses = [{ status: 401 }]
+    vi.spyOn(axios, 'post').mockRejectedValue(new Error('refresh failed'))
+
+    await expect(request.get('/documents')).rejects.toBeTruthy()
+
+    // 只发了原始那一次，没有重试
+    expect(seen).toHaveLength(1)
+    expect(localStorage.getItem('docmind_token')).toBeFalsy()
+  })
+
+  it('刷新期间并发发出的请求会被挂起，刷新完成后一起重放', async () => {
+    localStorage.setItem('docmind_token', 'old-token')
+    localStorage.setItem('docmind_refresh_token', 'refresh-ok')
+
+    // 两个请求都先 401；重放时都成功
+    responses = [{ status: 401 }, { status: 401 }, { status: 200 }, { status: 200 }]
+
+    let resolveRefresh: (v: any) => void = () => {}
+    const refreshGate = new Promise((res) => { resolveRefresh = res })
+    vi.spyOn(axios, 'post').mockImplementation((() => refreshGate) as any)
+
+    const p1 = request.get('/a')
+    const p2 = request.get('/b')
+
+    // 让两个请求都走到 401 分支
+    await new Promise((r) => setTimeout(r, 10))
+
+    // 放行刷新
+    resolveRefresh({ data: { data: { access_token: 'new-token', expires_in: 3600 } } })
+
+    const [r1, r2] = await Promise.all([p1, p2])
+
+    expect(r1.status).toBe(200)
+    expect(r2.status).toBe(200)
+    // 两个原始请求 + 两个重放 = 4 次
+    expect(seen.length).toBeGreaterThanOrEqual(4)
+    // 重放的请求都带上了新 token
+    const replayed = seen.slice(1).map(authHeaderOf).filter(Boolean)
+    expect(replayed.every((h) => h === 'Bearer new-token')).toBe(true)
+  })
+})
