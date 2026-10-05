@@ -195,6 +195,10 @@ async def update_organization(
 
         await db.commit()
         return {"success": True, "message": "更新成功"}
+    except AppError:
+        # issue #98：NotFoundError 等控制流异常自带正确状态码，先放行，
+        # 否则会被下面的 except Exception 重新包装成 500。
+        raise
     except ValueError as e:
         raise ValidationError(str(e))
     except Exception as e:
@@ -288,6 +292,9 @@ async def get_organization_members(
             })
 
         return {"success": True, "data": member_list}
+    except AppError:
+        # issue #98：NotFoundError 自带 404，先放行，避免被下面的 except Exception 降级为 500。
+        raise
     except Exception as e:
         raise AppError(f"获取成员列表失败: {str(e)}")
 

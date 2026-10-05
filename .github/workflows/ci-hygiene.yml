@@ -70,3 +70,34 @@ jobs:
             exit 1
           fi
           echo "未发现冲突标记"
+
+  # issue #98：`try` 体内**直接** raise 的控制流异常（AppError 及其子类、
+  # fastapi.HTTPException）不得被同层 `except Exception` 降级成 500 / 200 错误
+  # 字典。这一缺陷模式已复发多次（issue #82 / #90 / #98），加静态门禁防止第 8 次。
+  # 脚本零依赖（仅标准库 ast），不安装后端依赖栈。
+  except-control-flow:
+    name: Except Control Flow
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      # PR 门禁本体：扫 app/api/v1/endpoints + app/services，违规 → exit 1。
+      - name: Scan for control-flow exceptions swallowed by except Exception
+        working-directory: backend
+        run: python scripts/check_except_control_flow.py
+
+      # 同时跑检查器的鉴别力测试（违规样例必红、放行样例不误报、空树 exit 2）。
+      # tests/conftest.py 会 import fastapi 等全量后端依赖，本 job 不装这些；
+      # 该测试文件只用合成源码 + 标准库，因此用 --noconftest 跳过 conftest
+      # （全量单测仍由 ci-fast 的 backend-tests 覆盖，不在此处重复）。
+      - name: Checker discriminating-power tests
+        working-directory: backend
+        run: |
+          python -m pip install -q pytest
+          python -m pytest tests/unit/test_check_except_control_flow.py -q --noconftest
