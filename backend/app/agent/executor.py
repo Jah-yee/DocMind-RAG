@@ -35,6 +35,7 @@ from app.core.prometheus import (
     AGENT_TOOL_CALLS,
     AGENT_TOOL_LATENCY,
 )
+from app.core.step_runner import StepRunner
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +76,11 @@ class Executor:
     # Circuit breaker: skip remaining steps after this many consecutive failures
     MAX_CONSECUTIVE_FAILURES: int = 3
     TOOL_TIMEOUT_SECONDS: float = 30.0
+
+    # Hard asyncio-level bound for the per-step LLM call sits this much above the
+    # OpenAI client's own timeout, so it only fires when the client-level
+    # protection failed to bound the call (issue #106 §4b).
+    LLM_HARD_TIMEOUT_MARGIN_SECONDS: float = 10.0
 
     def __init__(
         self,
@@ -119,34 +125,8 @@ class Executor:
         while not plan.is_complete:
             ready_steps = plan.get_ready_steps()
 
-            # ── SERIAL MODE: ignore dependencies, execute in definition order ──
-            if self._execution_mode == "serial":
-                pending = [s for s in plan.steps if s.status == "pending"]
-                if not pending:
-                    break
-                # Check if any pending step has a failed dependency — skip it
-                {s.id for s in plan.steps if s.status == "completed"}
-                failed_ids = {s.id for s in plan.steps if s.status == "failed"}
-                for step in list(pending):
-                    if any(dep in failed_ids for dep in step.dependencies):
-                        step.status = "skipped"
-                        pending.remove(step)
-                        yield AgentEvent(
-                            type="thinking",
-                            content=f"跳过步骤（前置步骤失败）: {step.description}",
-                            thinking_type="evaluation",
-                            plan_id=plan.id,
-                            plan_step_id=step.id,
-                        )
-                step = pending[0]
-                async for event in self._execute_single_step(
-                    step, plan, history, organization_id, user_id, enable_thinking, ctx=ctx,
-                ):
-                    yield event
-                continue
-
-            # ── DAG MODE: dependency-aware execution ──
-            if not ready_steps:
+            # ── DAG MODE: deadlock check (serial mode ignores dependencies) ──
+            if self._execution_mode != "serial" and not ready_steps:
                 # Check for deadlock (pending steps with unsatisfied deps)
                 pending = [s for s in plan.steps if s.status == "pending"]
                 if pending:
@@ -156,6 +136,10 @@ class Executor:
                         s.status = "skipped"
                 break
 
+            # ── Reliability guards: reachable in BOTH execution modes ──
+            # These checks used to sit below the serial branch, whose `continue`
+            # made them unreachable in serial mode (issue #106 §4a). The order in
+            # DAG mode is unchanged: deadlock check → circuit breaker → low gain.
             # Circuit breaker: skip remaining steps after too many consecutive failures
             if self._consecutive_failures >= self.MAX_CONSECUTIVE_FAILURES:
                 remaining = [s for s in plan.steps if s.status == "pending"]
@@ -185,6 +169,31 @@ class Executor:
                     for s in remaining:
                         s.status = "skipped"
                     break
+
+            # ── SERIAL MODE: ignore dependencies, execute in definition order ──
+            if self._execution_mode == "serial":
+                pending = [s for s in plan.steps if s.status == "pending"]
+                if not pending:
+                    break
+                # Check if any pending step has a failed dependency — skip it
+                failed_ids = {s.id for s in plan.steps if s.status == "failed"}
+                for step in list(pending):
+                    if any(dep in failed_ids for dep in step.dependencies):
+                        step.status = "skipped"
+                        pending.remove(step)
+                        yield AgentEvent(
+                            type="thinking",
+                            content=f"跳过步骤（前置步骤失败）: {step.description}",
+                            thinking_type="evaluation",
+                            plan_id=plan.id,
+                            plan_step_id=step.id,
+                        )
+                step = pending[0]
+                async for event in self._execute_single_step(
+                    step, plan, history, organization_id, user_id, enable_thinking, ctx=ctx,
+                ):
+                    yield event
+                continue
 
             # Execute ready steps — parallel when multiple independent steps exist
             if len(ready_steps) > 1:
@@ -582,7 +591,18 @@ class Executor:
                     input={"tool_count": len(tools) if tools else 0, "step_id": step.id},
                 )
 
-            response = await self.client.chat.completions.create(
+            # Hard asyncio-level bound for the per-step LLM call (issue #106 §4b).
+            # The OpenAI client's own timeout only covers transport-level stalls;
+            # this bound sits wider than config.timeout so it fires exactly when
+            # the client-level protection failed to bound the call. max_retries=0:
+            # retries stay owned by the executor's own policy-driven retry loop —
+            # retrying here would re-multiply the attempt count.
+            call = await StepRunner(
+                timeout=self.config.timeout + self.LLM_HARD_TIMEOUT_MARGIN_SECONDS,
+                max_retries=0,
+                step_id=f"llm:{step.id}",
+            ).run(
+                self.client.chat.completions.create,
                 model=self.config.get_quick_model(),
                 messages=messages,
                 tools=tools if tools else None,
@@ -591,6 +611,26 @@ class Executor:
                 max_tokens=self.config.max_tokens,
                 timeout=self.config.timeout,
             )
+
+            if not call.success:
+                # StepRunner never raises. Re-surface the failure as a classified
+                # tool_error so the retry loop above (get_policy on error_type)
+                # still sees it — a failed StepResult must not become a silent
+                # success.
+                logger.error(f"LLM call failed for step {step.id}: {call.error}")
+                if lf and step_span:
+                    step_span.end(output=f"llm_error: {call.error}", level="ERROR")
+                yield AgentEvent(
+                    type="tool_error",
+                    tool_name=step.tool_hint or "llm",
+                    content=f"LLM 调用失败: {call.error}",
+                    plan_id=plan.id,
+                    plan_step_id=step.id,
+                    error_type=call.error_type,
+                )
+                return
+
+            response = call.output
 
             if lf and llm_span:
                 tool_names = [tc.function.name for tc in (response.choices[0].message.tool_calls or [])]
