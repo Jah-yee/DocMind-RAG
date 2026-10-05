@@ -5,9 +5,82 @@ All notable changes to DocMind will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.22.0] - 2026-10-05
+
+### Security
+
+- **工作流检索节点可跨租户读取知识库**（P0）。`tool_search` 节点的 `organization_id`
+  取自**请求体** `input`，而执行端点只校验工作流归属 —— 任意登录用户 POST
+  `{"organization_id": 42}` 即可读取其他组织的知识库内容，省略该字段则读 1 号组织。
+  现改为由服务端注入调用者所属组织，客户端传值一律忽略。
+- **组织域接口只校验权限、不校验成员身份**。`role` 是用户表上的**全局**字段，
+  因此任一租户管理员（`role="admin"`）可跨组织读写删其他组织的数据。
+  现为非超管必须 `current_user.organization_id == org_id`。
+- **`get_document_for_user` 移除 `role != "admin"` 旁路**（契约变更）。该条件让
+  任一租户管理员可读其他组织的文档。超管的跨组织访问不受影响。
+  原有的 `test_admin_crosses_org_boundary` 断言的正是该越权行为，已改写为
+  `test_tenant_admin_does_not_cross_org_boundary` 并补同组织放行的对照用例。
+- **"无组织"被静默当作 1 号组织**。注册产生的 `organization_id=None` 用户，
+  在 `current_user.organization_id or 1` 的兜底路径下会获得 1 号组织的读写权限。
+  现改为 fail-closed（403）。
+- **`execute_sql` 的列白名单与租户过滤均可绕过**。旧实现只要求每个 select 表达式中
+  **有一个**标识符命中白名单，且只要查询里出现 `organization_id` 字样就跳过过滤注入。
+  现要求全部标识符命中、函数名走白名单，且仅在等值限定为调用者组织时才跳过注入
+  （`OR` 放宽与 SELECT 投影伪装两种绕过已封堵）。
+- **代码沙箱可经 `string.Formatter().get_field()` 逃逸至 RCE**。AST 检查看不到
+  字符串字面量内部的属性访问。现封禁 `format`/`format_map`/`Formatter` 家族并扫描
+  字面量中的 dunder。
+- **用户删除与审计日志缺少组织校验**；补齐后与兄弟端点一致。
+
+### Added
+
+- **`integration` job**（`ci-fast.yml`）：`needs: [backend-tests, migration-mysql]` +
+  `if: push && refs/heads/develop`。语义是「integration 永远验证一个已通过快速门禁的
+  develop 提交」。**此前 179 个集成测试从未在 CI 中运行过**（nightly 在第一步即失败，
+  后续被 skip）。
+- **`dependency-review.yml`**：只审查本 PR 新增/升级依赖的已知漏洞，`high+` 阻断，
+  scope 为 `runtime + development`（默认只含 runtime，而本仓库 4/6 个 high 源自
+  devDependency）。
+- **`docs/ci-charter.md`**：CI 章程，写明各门禁职责、边界、以及"新增检查必须验证
+  fail-closed"的硬规则。
+- **`ci-hygiene.yml`**：commitlint（只校验 PR 新增提交）、PR 自动打标签、冲突标记检测。
+- **`docker-build.yml`**：容器相关文件变更时才构建（此前占 nightly 墙钟的 99%，
+  且每天无条件重跑）。
+
+### Changed
+
+- **`ci-nightly.yml` 由每天改为每周一**，定位调整为「环境漂移检查」；其 `checkout`
+  显式指向 `develop`（`schedule` 只在默认分支触发的平台语义）。
+- **pip 全面换 `uv`**（`ci-fast` 三处 + `ci-nightly` 一处）。`security` job 有意保留
+  pip：它没有 `setup-python`，`--system` 的锚定方式不同且与 `pip-audit` 行为耦合。
+- **覆盖率门禁收口**：`fail_under` 从 `pyproject.toml`（全局）移到使用点
+  （`--cov-fail-under=42` 只加在 backend-tests 的 3.12 腿）。全局设置会让只跑
+  `tests/integration/`（约 32%）的 integration job 误报失败 —— 尽管 179 个测试全过。
+- 依赖更新：axios、redis、pypdf、pyjwt、python-jose、aiosqlite、vue-i18n 等。
 
 ### Fixed
+
+- **agent 核心 13 处「架构存在但运行时不生效」的接线断点**：
+  - `executor` 向 `AgentEvent` 传了不存在的关键字 `reflect_result`，任何工具失败都会
+    抛 `TypeError` 并被外层 `except` 吞掉，模型收到的是 Python 报错；
+  - **重试机制整条是死代码**：`error_type` 从未被赋值，策略恒落到 `unknown → fatal`，
+    首次失败即跳 fallback，`max_retries`/退避/重试提示全部不可达；
+  - `ContextEngine` 被实例化但 `fit()` 从未调用，上下文压缩从未运行；且其
+    `_truncate_messages` 用字符数换算 token 预算，每轮必然超支；
+  - `ReflectionResult` 被丢弃（异步生成器不允许 `return` 值），`retry_step_id`
+    既未进事件也未使用，loop 中的重试分支从未触发；
+  - `plan_goal` 被 `plan_id` 覆盖，所有目标感知的 LLM 评估都在评判一个随机 hex id；
+  - 条件路由 `_should_continue_execution` 恒不可达；工作记忆跨轮次污染下游提示词；
+    并行步骤在客户端断开时不取消；`ExecutorAgent` 以空参数调用工具；
+    `web_search` 的阻塞调用冻结事件循环。
+- **RAG 管线**：重排器拿到空文档文本；语义分块超长时截断而非切分（静默丢内容）；
+  子查询合并去重键恒为空；检索缓存与答案缓存共用命名空间导致空回答。
+- **CI**：`pip-audit` 结构校验把正常报告判成"工具失败"；`pytest.ini` 遮蔽
+  `pyproject.toml` 导致 markers 失效；`requirements.txt` 缺 `sqlalchemy[asyncio]`
+  导致 CI 无 greenlet；`conflict-markers` 首版恒绿（三点 diff 在浅克隆下 fatal，
+  被管道 grep 的退出码掩盖）；`retriever.py` 的 SHA1 静态扫描告警。
+
+
 - **CI：nightly 的 pip-audit 结构校验把正常报告判成"工具失败"**（`ci-nightly.yml`）。
   该校验内联在 workflow 里，并写死了「pip-audit 的 JSON 是顶层数组」这个假设；而 pip-audit 2.x
   实际输出的是 `{"dependencies": [...], "fixes": [...]}`。于是一份**结构完全正常、也确实扫出了
