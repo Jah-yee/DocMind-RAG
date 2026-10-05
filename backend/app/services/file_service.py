@@ -634,6 +634,9 @@ class FileUploadService:
                 "message": f"已上传 {uploaded_chunks} 个分块"
             }
 
+        except HTTPException:
+            # issue #98：非法哈希本应 400，不能被下面的 except Exception 吞成 200 错误字典。
+            raise
         except Exception as e:
             logger.error(f"获取上传状态失败: {file_hash}, 错误: {str(e)}")
             return {

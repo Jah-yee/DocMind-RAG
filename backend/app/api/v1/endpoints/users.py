@@ -444,6 +444,9 @@ async def get_user_profile(
             # 安全加固：只返回掩码，不泄露完整 API Key
             "api_key": _mask_api_key(current_user.api_key)
         }
+    except (AppError, NotFoundError, ValidationError, AuthorizationError, ConflictError):
+        # issue #98：NotFoundError 自带 404，先放行，避免被下面的 except Exception 降级为 500。
+        raise
     except Exception as e:
         logger.exception(f"Error in GET /me: {str(e)}")
         raise AppError(f"Get user profile failed: {str(e)}")

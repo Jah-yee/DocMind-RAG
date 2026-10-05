@@ -627,6 +627,9 @@ async def calculate_text_similarity(
             "similarity_percentage": float(cosine_similarity * 100)
         }
 
+    except (AppError, NotFoundError, ValidationError, AuthorizationError, ConflictError):
+        # issue #98：控制流异常自带状态码，先放行，避免被下面的 except Exception 降级为 500。
+        raise
     except Exception as e:
         raise AppError(f"计算文本相似度失败: {str(e)}")
 

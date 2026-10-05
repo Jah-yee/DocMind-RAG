@@ -633,6 +633,10 @@ async def chat_parse_upload(
                 "file_size": result.get("file_size", 0),
             }
         }
+    except AppError:
+        # issue #98：ValidationError（如文件过大 → 400）等控制流异常自带正确状态码，
+        # 先放行；否则会被下面的 except Exception 重新包装成 500。
+        raise
     except Exception as e:
         logger.error(f"[parse-upload] 解析失败: {e}", exc_info=True)
         raise AppError(f"文件解析失败: {str(e)}")
