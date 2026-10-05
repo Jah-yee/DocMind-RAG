@@ -7,9 +7,20 @@
 所以登录侧彻底停写，本用例固定这条行为。
 
 拦截点选在 Redis 客户端这一层（而不是断言源码里没有 `setex` 字样，后者改个
-函数名就失效）：`app.core.redis.redis_client` 与 `app.core.redis.get_redis`
-都被换成替身，于是无论实现用哪条路把快照写回去都会被记录 ——
-直接 `redis_client.setex(...)`，或经 `RedisTools.set_cache` → `get_redis()`。
+函数名就失效）。四种可想象的写入路径全部被同一个替身接住，断言都落在它上面：
+  1. 函数内局部 `from app.core.redis import redis_client`（历史缺陷的形状）——
+     打桩 `app.core.redis.redis_client` 属性，调用时 import 必然读到替身；
+  2. 模块级 `from app.core.redis import redis_client`（import 时捕获 proxy，
+     本仓 proxy 设计鼓励的 house style）—— 打桩 endpoint 模块命名空间里的
+     同名属性（`create=True`）；替身还直接挂到 holder 的 `_client` 上，
+     即使某处已提前捕获了 proxy，委托查询最终也落到替身；
+  3. `RedisTools.set_cache(...)` → `get_redis()` —— 打桩 `get_redis`；
+  4. 任何持有 `_RedisProxy` 单例的代码 —— holder 打桩兜底。
+
+（路径 2/4 的加固来自独立评审 ws103 的 minor-2：此前只打桩前两个入口时，
+模块级 import 会在首个参数运行期间捕获当时那个 mock，让第二个参数静默漏检。
+断言对替身上 `setex` 与 `set` 两种字符串写取并集后过滤 `user:` 前缀——评审
+delta 轮发现只扫 `setex` 时 `.set()` 形状可静默漏过，同批已补上。）
 """
 
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -17,7 +28,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from fastapi.testclient import TestClient
 
+import app.core.redis as redis_module
+from app.core.database import get_db
+from app.main import app
 from app.models.user import User
+from app.services.audit_service import audit_service
 from app.services.auth_service import auth_service
 
 _FORM_LOGIN = "/api/v1/auth/login"
@@ -53,6 +68,7 @@ def _redis_stand_in() -> MagicMock:
     """
     client = MagicMock()
     client.setex = AsyncMock()
+    client.set = AsyncMock()
     client.get = AsyncMock(return_value=None)
     client.delete = AsyncMock()
     client.incr = AsyncMock(return_value=1)
@@ -63,10 +79,6 @@ def _redis_stand_in() -> MagicMock:
 
 def _login_once(route: str):
     """走一次真实登录成功流程：只替换 DB session、Redis 客户端与审计落库。"""
-    from app.core.database import get_db
-    from app.main import app
-    from app.services.audit_service import audit_service
-
     fake_user = _fake_user()
     result = MagicMock()
     result.scalar_one_or_none.return_value = fake_user
@@ -95,23 +107,31 @@ def _login_once(route: str):
         app.dependency_overrides.pop(get_db, None)
 
 
+def _user_cache_writes(redis_mock: MagicMock) -> list[str]:
+    """替身上所有字符串写（`setex` / `set`）里以 `user:` 开头的键。"""
+    string_writes = redis_mock.setex.await_args_list + redis_mock.set.await_args_list
+    return [
+        str(call.args[0])
+        for call in string_writes
+        if call.args and str(call.args[0]).startswith("user:")
+    ]
+
+
 @pytest.mark.parametrize("route", [_FORM_LOGIN, _JSON_LOGIN])
 def test_login_success_does_not_write_user_cache(route: str):
     redis_mock = _redis_stand_in()
 
     with (
-        patch("app.core.redis.redis_client", redis_mock),
-        patch("app.core.redis.get_redis", AsyncMock(return_value=redis_mock)),
+        patch.object(redis_module, "redis_client", redis_mock),
+        patch.object(redis_module, "get_redis", AsyncMock(return_value=redis_mock)),
+        patch.object(redis_module._holder, "_client", redis_mock),
+        patch("app.api.v1.endpoints.auth.redis_client", redis_mock, create=True),
     ):
         response = _login_once(route)
 
     assert response.status_code == 200, f"前提不成立：登录没有成功 —— {response.text}"
 
-    user_cache_writes = [
-        call.args[0]
-        for call in redis_mock.setex.await_args_list
-        if call.args and str(call.args[0]).startswith("user:")
-    ]
+    user_cache_writes = _user_cache_writes(redis_mock)
     assert user_cache_writes == [], (
         f"{route} 又写回了无人读取的 `user:{{id}}` 快照：{user_cache_writes}。"
         "该快照没有任何读方（身份判定只认 DB），只会制造下一份陈旧快照。"
