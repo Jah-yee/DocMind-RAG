@@ -353,31 +353,36 @@ class AuthService:
             return False
 
     async def get_user_by_username(self, db: AsyncSession, username: str) -> User | None:
-        """根据用户名获取用户"""
-        try:
-            result = await db.execute(select(User).where(User.username == username))
-            return result.scalar_one_or_none()
-        except Exception as e:
-            logger.error(f"根据用户名获取用户失败: {str(e)}")
-            return None
+        """根据用户名获取用户。
+
+        查无此人返回 None；**查询本身失败时异常冒泡**（issue #103 第 2 条，
+        与 `get_user_by_id` 同族）：`except Exception: return None` 会把
+        「DB 故障」伪装成「查不到」，调用方无从区分。username 列有唯一约束，
+        「查不到」永远不会导致重复写入，无需用吞异常来兜底。
+        """
+        result = await db.execute(select(User).where(User.username == username))
+        return result.scalar_one_or_none()
 
     async def get_user_by_email(self, db: AsyncSession, email: str) -> User | None:
-        """根据邮箱获取用户"""
-        try:
-            result = await db.execute(select(User).where(User.email == email))
-            return result.scalar_one_or_none()
-        except Exception as e:
-            logger.error(f"根据邮箱获取用户失败: {str(e)}")
-            return None
+        """根据邮箱获取用户。
+
+        查无此人返回 None；**查询本身失败时异常冒泡**（issue #103 第 2 条，
+        与 `get_user_by_id` 同族）。email 列有唯一约束，理由同上。
+        """
+        result = await db.execute(select(User).where(User.email == email))
+        return result.scalar_one_or_none()
 
     async def get_user_by_id(self, db: AsyncSession, user_id: int) -> User | None:
-        """根据ID获取用户"""
-        try:
-            result = await db.execute(select(User).where(User.id == user_id))
-            return result.scalar_one_or_none()
-        except Exception as e:
-            logger.error(f"根据ID获取用户失败: {str(e)}")
-            return None
+        """根据ID获取用户。
+
+        查无此人返回 None；**查询本身失败时异常冒泡**（issue #103 第 2 条）。
+        此前的 `except Exception: return None` 会把 DB 故障伪装成「用户不存在」，
+        经 /auth/refresh 映射成 401 —— 前端收到后清 token 跳登录页，用户看到
+        「登录已过期」，真实原因是数据库挂了。`scalar_one_or_none()` 对「查无
+        此人」本来就走 None，语义天然可区分，异常必须留给 5xx。
+        """
+        result = await db.execute(select(User).where(User.id == user_id))
+        return result.scalar_one_or_none()
 
     async def create_user(
         self,

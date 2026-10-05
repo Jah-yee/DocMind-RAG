@@ -126,7 +126,11 @@ def _auth_header(user_id: int) -> dict[str, str]:
 
 
 def _snapshot_as_written_by_login(user: User) -> str:
-    """复刻 `auth.py` 登录路径写进 Redis 的那份快照。
+    """复刻**历史版本**登录路径写进 Redis 的那份快照（issue #103 起登录不再写）。
+
+    保留这个 helper 是因为 `_plant_stale_snapshot` 需要它来构造「陈旧快照」，
+    验证这种快照会被忽略。它现在复刻的是**旧实现的写入格式**，不是当前行为：
+    登录侧已停写 `user:{id}`（该快照没有任何读方）。
 
     关键：它是**精简字典**，没有 `is_active`（也没有 `is_superuser`）。
     这正是当年最危险的一种陈旧快照 —— 读路径用 `.get("is_active", True)` 兜底，

@@ -155,10 +155,13 @@ async def login(
             "role": user.role or "user",
             "preferences": getattr(user, "preferences", None),
         }
-        # 确保可 JSON 序列化
+        # 确保 user_info 可 JSON 序列化（响应体防御：存在不可序列化的字段时
+        # FastAPI 会在构造响应时 500，所以先验证，失败则退回简化结构）。
+        # 序列化结果**只求值不绑定**——它唯一的消费者是 `user:{id}` 的 Redis
+        # 快照，而该快照已无任何读方，登录侧不再写缓存（issue #103）。
         try:
             logger.info("Attempting to JSON serialize user_info.")
-            user_json_str = json.dumps(jsonable_encoder(user_info))
+            json.dumps(jsonable_encoder(user_info))
             logger.info("user_info JSON serialization successful.")
         except Exception as ser_err:
             logger.warning(f"user_info 序列化失败，使用简化结构: {ser_err}")
@@ -166,21 +169,8 @@ async def login(
             user_info.setdefault("full_name", None)
             user_info.setdefault("organization_id", None)
             user_info.setdefault("preferences", None)
-            user_json_str = json.dumps(user_info)
+            json.dumps(user_info)
             logger.warning("user_info simplified and JSON serialization successful.")
-
-        try:
-            from app.core.redis import redis_client
-            if redis_client:
-                logger.info(f"Attempting to cache user info in Redis for user ID: {user.id}")
-                await redis_client.setex(
-                    f"user:{user.id}",
-                    settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
-                    user_json_str,
-                )
-                logger.info("User info cached in Redis successfully.")
-        except Exception as redis_err:
-            logger.warning(f"Redis cache skip (login still success): {redis_err}")
 
         # 4. 审计登录成功（会话记录已在上方随 token 一起创建）
         try:
@@ -273,21 +263,13 @@ async def login_json(
             "role": getattr(user, "role", None) or "user",
             "preferences": getattr(user, "preferences", None),
         }
+        # 与 form 登录一致：只验证 user_info 可 JSON 序列化（响应体防御），
+        # 序列化结果不绑定——登录不再写无人读取的 `user:{id}` 缓存（issue #103）。
         try:
-            user_json_str = json.dumps(jsonable_encoder(user_info))
+            json.dumps(jsonable_encoder(user_info))
         except Exception:
             user_info = {k: v for k, v in user_info.items() if k in ("id", "username", "email", "role") or v is not None}
-            user_json_str = json.dumps(user_info)
-        try:
-            from app.core.redis import redis_client
-            if redis_client:
-                await redis_client.setex(
-                    f"user:{user.id}",
-                    settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
-                    user_json_str,
-                )
-        except Exception as redis_err:
-            logger.warning(f"Redis cache skip: {redis_err}")
+            json.dumps(user_info)
         return {
             "success": True,
             "message": "登录成功",
