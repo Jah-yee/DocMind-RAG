@@ -169,8 +169,15 @@ class Planner:
         history: list[dict[str, str]] | None = None,
         memory_context: str = "",
         ctx: Any = None,  # ExecutionContext (avoid circular import)
+        replan_feedback: str = "",
     ) -> AsyncGenerator[AgentEvent, Plan | None]:
         """Generate a plan, yielding thinking events as reasoning streams.
+
+        Args:
+            replan_feedback: 反思判定 replan 时携带的缺口/质量问题文本
+                （issue #106 §5a）。非空表示这是一次**重新规划**：规则模板
+                只会原样复用上一版计划、修不了缺口，因此跳过模板直接走 LLM
+                规划，并把反馈注入提示词。
 
         Yields: thinking events during plan generation
         Sends back: Plan object when complete (via generator return)
@@ -196,7 +203,9 @@ class Planner:
         # Experiments 001-003 proved the LLM-based Planner will not decompose
         # tasks (avg_steps ≈ 1).  When structured planning is enabled, the
         # system classifies the query and builds a template plan directly.
-        structured_plan = self._try_structured_planning(plan_id, query)
+        # 重新规划时跳过模板：同一 query 分类出的模板与上一版完全相同，
+        # 复制一份一模一样的计划无法回应反思指出的缺口。
+        structured_plan = None if replan_feedback else self._try_structured_planning(plan_id, query)
         if structured_plan:
             self._validate_dag(structured_plan)
             yield AgentEvent(type="plan_start", plan_id=plan_id, content="分析任务类型，制定执行计划...")
@@ -251,6 +260,18 @@ class Planner:
                     system_prompt += f"\n\n{exp_context}"
             except Exception:
                 pass
+
+        # ── Re-planning feedback (issue #106 §5a) ──
+        # 反思判定 replan 时注入：上一版计划哪里不行、缺什么。让 LLM 据此
+        # 修正计划，而不是重复上一版。
+        if replan_feedback:
+            system_prompt += (
+                "\n\n## 反思反馈（重新规划的依据）\n"
+                "上一轮执行被反思判定为 **计划需要重新制定**，反馈如下：\n"
+                f"{replan_feedback}\n"
+                "\n请针对以上反馈重新制定计划：补齐缺失的信息、更换无效的工具、"
+                "调整步骤拆分。用户目标没有变化；不要原样重复上一版计划。"
+            )
 
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": system_prompt},

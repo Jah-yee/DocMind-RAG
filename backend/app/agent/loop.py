@@ -43,6 +43,15 @@ __all__ = [
 
 MAX_RESULT_TOKENS = 3000
 
+# 一轮 run 内允许的重新规划次数上限（issue #106 §5a）。
+# 背景：reflector 判定 "replan" 此前只被记录、从不被执行（唯一分支只认 retry）。
+# 现在 replan 会真的回到规划阶段并重跑整轮执行——这是本循环里最贵的一条路径
+# （一次 replan ≈ 一次完整 run 的成本）。上限设为 1 的理由：反思已经明确说出
+# 计划错在哪里，给一次修正机会即可；若修正后的计划仍被同一反射器判错，继续
+# 重规划只会以同样的理由循环（反射器倾向于持续投 replan），成本线性增长而
+# 收益不明。上限保证最坏情况是「最多 2 次规划 + 2 轮执行」，run 一定终止。
+MAX_REPLANS_PER_RUN = 1
+
 
 def _smart_truncate(result: str, tool_name: str) -> str:
     """Smart truncation that preserves structure based on tool type."""
@@ -255,7 +264,341 @@ class PERAgentLoop:
             except Exception as e:
                 logger.warning(f"Memory recall failed: {e}")
 
-        # ── Phase 1: Planning ────────────────────────────────────────────
+        # ── Phase 1–3: 规划 → 执行 → 反思（含有界重新规划）────────────────
+        # issue #106 §5a：reflector 的 "replan" 判定此前只被记录、从不执行
+        # （唯一分支只认 retry）。现在它真的回到规划阶段：把反思给出的缺口/
+        # 质量问题作为反馈交给 planner 生成新计划，再继续执行。次数上限由
+        # MAX_REPLANS_PER_RUN 保证终止，不允许无界循环。
+        plan: Plan | None = None
+        final_output = ""
+        replan_feedback = ""
+        replan_attempts = 0
+
+        while True:
+            # ── Phase 1: Planning ────────────────────────────────────────
+            # An async generator cannot return a value, so the built plan
+            # travels back through plan_sink.
+            plan_sink: list[Plan] = []
+            async for event in self._plan_once(
+                query=query,
+                history=history,
+                memory_context=memory_context,
+                ctx=ctx,
+                plan_sink=plan_sink,
+                replan_feedback=replan_feedback,
+            ):
+                yield event
+            plan = plan_sink[0]
+
+            # ── Phase 2: Execution ───────────────────────────────────────────
+            pass_output = ""
+
+            if self.config.enable_tools:
+                self.executor.reset_for_request()
+                execution_output = ""
+                try:
+                    async for event in self.executor.execute(
+                        plan=plan,
+                        history=history,
+                        organization_id=self.organization_id,
+                        user_id=self.user_id,
+                        enable_thinking=self.config.enable_thinking,
+                        ctx=ctx,
+                    ):
+                        yield event
+                        if event.type == "chunk":
+                            pass_output += event.content
+                            execution_output += event.content
+                        elif event.type == "execution_step_result" and event.content:
+                            execution_output += event.content
+                finally:
+                    # Conditional routing belongs in a finally so it still runs when the
+                    # consumer stops early (client disconnect), and it reads everything
+                    # the executor produced rather than only the bare "chunk" events.
+                    remaining_steps = [s for s in plan.steps if s.status == "pending"]
+                    if remaining_steps and not self._should_continue_execution(execution_output, plan, remaining_steps):
+                        skipped = [s for s in remaining_steps if s.status == "pending"]
+                        for s in skipped:
+                            s.status = "skipped"
+                        if skipped:
+                            yield AgentEvent(
+                                type="thinking",
+                                content=f"已有充分信息，跳过 {len(skipped)} 个剩余步骤",
+                                thinking_type="evaluation",
+                                plan_id=plan.id,
+                                plan_progress=plan.progress,
+                            )
+                            logger.info("Conditional routing: %d steps skipped (sufficient info)", len(skipped))
+            else:
+                # Tool-less mode: single LLM call
+                messages = self._build_messages(query, history, context_docs, memory_context)
+                try:
+                    response = await self.client.chat.completions.create(
+                        model=self.config.get_deep_model(),
+                        messages=messages,
+                        temperature=self.config.temperature,
+                        max_tokens=self.config.max_tokens,
+                        timeout=self.config.timeout,
+                    )
+                    content = response.choices[0].message.content or ""
+                    if content:
+                        yield AgentEvent(type="chunk", content=content)
+                        pass_output = content
+                except Exception as e:
+                    yield AgentEvent(type="error", content=f"LLM Error: {e}")
+
+            # 最终答案以最后一版计划的执行产出为准：replan 后旧计划的产出
+            # 已被取代，不能再混进 record_interaction / run report。
+            final_output = pass_output
+
+            # ── Phase 2b: Quality Gate ────────────────────────────────────────
+            if plan.steps:
+                from app.agent.quality_gate import quality_gate_check
+                step_results = self.memory.get_all_results()
+                qg_result = quality_gate_check(step_results)
+                # §5b：质检结论落成结构化状态（每轮覆盖，防止 replan 后残留
+                # 上一轮的失败标记）。run report 直接读它；SSE 侧另经 decision 携带。
+                ctx.artifacts["quality_gate"] = {
+                    "passed": qg_result["passed"],
+                    "fatal_issues": list(qg_result.get("fatal_issues", [])),
+                }
+                if not qg_result["passed"]:
+                    fatal = qg_result.get("fatal_issues", [])
+                    warnings = qg_result["summary"]
+                    if fatal:
+                        yield AgentEvent(
+                            type="thinking",
+                            content=f"质量门控发现 {len(fatal)} 个问题:\n" + "\n".join(fatal),
+                            thinking_type="evaluation",
+                        )
+                        # §5b：结构化信号 —— fatal_issues 非空时本次 run 不再被
+                        # 呈现为一次干净的成功（run report 的 clean_success=False）。
+                        # 这里只做记录与暴露：不阻断、不凭空发明重试；将来若要做
+                        # 更强的 actuation（阻断/重试），入口就是这个分支。
+                        ctx.record_decision(
+                            "quality_gate",
+                            "fatal_issues",
+                            f"{len(fatal)} 个致命问题: " + "；".join(fatal)[:300],
+                        )
+                    if self.config.enable_thinking:
+                        yield AgentEvent(
+                            type="thinking",
+                            content=warnings[:500],
+                            thinking_type="evaluation",
+                        )
+                    logger.info("Quality gate: %d passed, %d concerns, %d failed",
+                        sum(1 for g, _ in qg_result["grades"].values() if g == "A"),
+                        sum(1 for g, _ in qg_result["grades"].values() if g == "C"),
+                        sum(1 for g, _ in qg_result["grades"].values() if g == "F"),
+                    )
+
+                # ── Phase 2c: Experience write-back（经验回路的写入侧）───────────
+                # 此前这个回路是**断的**：planner 读经验（format_for_planner），但 runtime
+                # 从不写 ExperienceStore —— 只有离线的 benchmark 批量抽取（run_extract.py）
+                # 会写。结果是「读一个永远不会增长的经验库」。
+                #
+                # 写入失败绝不能影响用户请求：整段包在 try 里，只记 warning。
+                try:
+                    await self._write_experiences(ctx, plan, qg_result)
+                except Exception as e:
+                    logger.warning("Experience write-back failed: %s", e)
+
+            # ── Phase 3: Reflection ──────────────────────────────────────────
+            replan_requested = False
+            if self.config.enable_reflection and plan.steps:
+                results = self.memory.get_all_results()
+                feedback_parts: list[str] = []
+                async for event in self.reflector.reflect(plan, results, ctx=ctx):
+                    yield event
+                    # Check reflection decision
+                    if event.type == "reflection" and event.reflection_result == "retry":
+                        step_id = event.plan_step_id
+                        if step_id:
+                            async for evt in self._retry_step(step_id, plan, history):
+                                if evt.type == "chunk":
+                                    final_output += "\n\n[重试结果]\n" + evt.content
+                                yield evt
+                    elif event.type == "reflection" and event.reflection_result == "replan":
+                        # 一轮 reflect 会发两条 reflection 事件（判定 + 摘要），
+                        # 这里只负责收集反馈文本，去重交给 replan_requested 标志。
+                        replan_requested = True
+                        if event.content:
+                            feedback_parts.append(event.content)
+
+                if replan_requested:
+                    if not self.config.enable_planning:
+                        # 规划被禁用时 replan 无从执行，只记录原因（无副作用）。
+                        ctx.record_decision(
+                            "plan", "replan_unavailable", "规划已禁用，无法重新规划",
+                        )
+                    elif replan_attempts >= MAX_REPLANS_PER_RUN:
+                        # 有界性：达到上限后不再重新规划，按当前结果收尾。
+                        ctx.record_decision(
+                            "plan",
+                            "replan_exhausted",
+                            f"重新规划次数已达上限 {MAX_REPLANS_PER_RUN}，不再重新规划",
+                        )
+                        yield AgentEvent(
+                            type="thinking",
+                            content=(
+                                f"反思判定需要重新规划，但本轮运行的重新规划次数已达上限"
+                                f"（{MAX_REPLANS_PER_RUN} 次），按当前结果收尾"
+                            ),
+                            thinking_type="evaluation",
+                            plan_id=plan.id,
+                        )
+                    else:
+                        replan_attempts += 1
+                        replan_feedback = "\n".join(feedback_parts)[:2000] or (
+                            "反思判定计划需要重做，但未给出具体缺口/质量问题。"
+                        )
+                        ctx.record_decision(
+                            "plan",
+                            "replan",
+                            f"第 {replan_attempts}/{MAX_REPLANS_PER_RUN} 次重新规划；"
+                            f"反思反馈: {replan_feedback[:200]}",
+                        )
+                        yield AgentEvent(
+                            type="thinking",
+                            content=(
+                                f"因反思判定 replan，正在重新规划"
+                                f"（第 {replan_attempts}/{MAX_REPLANS_PER_RUN} 次）..."
+                            ),
+                            thinking_type="planning",
+                            plan_id=plan.id,
+                            plan_progress=plan.progress,
+                        )
+                        await _yield_control()
+                        # 新一轮执行必须与旧计划的步骤结果彻底隔离：否则旧计划
+                        # 独有步骤 id 的结果会被下一轮质检/反思再次读到。
+                        self.memory.reset_working()
+                        continue
+
+            break
+
+        # ── Phase 3b: Adversarial Review ────────────────────────────────
+        if self.config.enable_reflection and plan.steps:
+            results = self.memory.get_all_results()
+            yield AgentEvent(
+                type="thinking",
+                content="进行对抗性质检，审查结果中可能存在的问题...",
+                thinking_type="evaluation",
+            )
+            await _yield_control()
+            review = await self.reviewer.review(plan, results)
+            issues = review.get("issues_found", [])
+            high_issues = [i for i in issues if i.get("severity") == "high"]
+            # §5c：消费 recommendation（此前全仓零读取者）。取值收敛到
+            # pass/revise/reject，未识别值按 pass 处理（不制造噪音）。
+            raw_recommendation = str(review.get("recommendation") or "pass").strip().lower()
+            if raw_recommendation.startswith("reject"):
+                recommendation = "reject"
+            elif raw_recommendation.startswith("revise"):
+                recommendation = "revise"
+            else:
+                recommendation = "pass"
+            # 结构化记录：run report 读取；SSE 侧另经 decision 携带。
+            ctx.artifacts["review"] = {
+                "recommendation": recommendation,
+                "issue_count": len(issues),
+                "high_severity_count": len(high_issues),
+            }
+            if recommendation != "pass":
+                # reject/revise 的后果 = 被记录（结构化决策）+ 被暴露（SSE 事件）。
+                # 保守原则：不据此重试/阻断，也不改用户可见的答案正文。
+                verdict = "结果不可接受" if recommendation == "reject" else "结果需要修改"
+                ctx.record_decision(
+                    "review",
+                    recommendation,
+                    f"对抗审查判定 {recommendation}（{verdict}）："
+                    f"{len(issues)} 个问题，其中 {len(high_issues)} 个高严重度",
+                )
+                yield AgentEvent(
+                    type="thinking",
+                    content=(
+                        f"对抗审查判定 {recommendation}（{verdict}）："
+                        f"{len(issues)} 个问题，{len(high_issues)} 个高严重度"
+                    ),
+                    thinking_type="evaluation",
+                )
+            if issues:
+                if high_issues:
+                    logger.info("Adversarial review found %d high-severity issues", len(high_issues))
+                    for issue in high_issues:
+                        final_output += (
+                            f"\n\n⚠️ **审查发现**: {issue.get('description', '')}\n"
+                            f"  建议: {issue.get('suggestion', '')}"
+                        )
+                        yield AgentEvent(
+                            type="thinking",
+                            content=f"审查发现高风险问题: {issue.get('description', '')}",
+                            thinking_type="evaluation",
+                        )
+                # Log all issues
+                for issue in issues:
+                    logger.info(
+                        "Review issue [%s]: %s",
+                        issue.get("severity", "unknown"),
+                        issue.get("description", "")[:100],
+                    )
+
+        # ── Phase 4: Store + Finalize ─────────────────────────────────────
+        await self.memory.record_interaction(query, final_output)
+
+        ctx.mark_done()
+        ctx.record_decision("finalize", "complete", "Agent loop finished")
+        # Persist for execution replay
+        try:
+            await ctx.save()
+        except Exception:
+            pass
+
+        # ── Run report (observe-only, no behavior change) ───────────────
+        # Pure projection of what the run already recorded into ctx.
+        # Does NOT trigger retry/replan/approval/memory/experience. See ADR-1.
+        run_report = build_run_report(ctx, final_output)
+        try:
+            logger.info("\n%s", render_run_report_text(run_report))
+        except Exception:
+            pass
+        yield AgentEvent(
+            type="run_report",
+            content=render_run_report_text(run_report),
+        )
+
+        # Yield execution context as a data event for observability
+        yield AgentEvent(
+            type="execution_context",
+            content=ctx.to_dict(),
+            plan_id=plan.id if plan else "",
+            plan_progress=1.0,
+        )
+
+        elapsed = (time.perf_counter() - start_time) * 1000
+        logger.info(
+            f"PER loop completed in {elapsed:.0f}ms | "
+            f"Plan: {plan.goal[:50]}... | Steps: {plan.completed_steps}/{plan.total_steps} | "
+            f"Output: {len(final_output)} chars"
+        )
+
+        yield AgentEvent(type="done", plan_progress=1.0)
+
+    async def _plan_once(
+        self,
+        query: str,
+        history: list[dict[str, str]] | None,
+        memory_context: str,
+        ctx: ExecutionContext,
+        plan_sink: list[Plan],
+        replan_feedback: str = "",
+    ) -> AsyncGenerator[AgentEvent, None]:
+        """Run one planning pass and append the built Plan to ``plan_sink``.
+
+        An async generator cannot return a value, so the Plan travels back
+        through the caller-provided sink (same constraint as the planner's
+        own event stream). ``replan_feedback`` carries the reflector's
+        gaps/quality-issues on a re-planning pass (issue #106 §5a).
+        """
         plan: Plan | None = None
         import uuid as _uuid_mod
 
@@ -271,6 +614,7 @@ class PERAgentLoop:
                 history=history,
                 memory_context=memory_context,
                 ctx=ctx,
+                replan_feedback=replan_feedback,
             ):
                 yield event
                 if event.type == "plan_start":
@@ -322,187 +666,7 @@ class PERAgentLoop:
                 steps=[PlanStep(id="s1", description=query)],
             )
 
-        # ── Phase 2: Execution ───────────────────────────────────────────
-        final_output = ""
-
-        if self.config.enable_tools:
-            self.executor.reset_for_request()
-            execution_output = ""
-            try:
-                async for event in self.executor.execute(
-                    plan=plan,
-                    history=history,
-                    organization_id=self.organization_id,
-                    user_id=self.user_id,
-                    enable_thinking=self.config.enable_thinking,
-                    ctx=ctx,
-                ):
-                    yield event
-                    if event.type == "chunk":
-                        final_output += event.content
-                        execution_output += event.content
-                    elif event.type == "execution_step_result" and event.content:
-                        execution_output += event.content
-            finally:
-                # Conditional routing belongs in a finally so it still runs when the
-                # consumer stops early (client disconnect), and it reads everything
-                # the executor produced rather than only the bare "chunk" events.
-                remaining_steps = [s for s in plan.steps if s.status == "pending"]
-                if remaining_steps and not self._should_continue_execution(execution_output, plan, remaining_steps):
-                    skipped = [s for s in remaining_steps if s.status == "pending"]
-                    for s in skipped:
-                        s.status = "skipped"
-                    if skipped:
-                        yield AgentEvent(
-                            type="thinking",
-                            content=f"已有充分信息，跳过 {len(skipped)} 个剩余步骤",
-                            thinking_type="evaluation",
-                            plan_id=plan.id,
-                            plan_progress=plan.progress,
-                        )
-                        logger.info("Conditional routing: %d steps skipped (sufficient info)", len(skipped))
-        else:
-            # Tool-less mode: single LLM call
-            messages = self._build_messages(query, history, context_docs, memory_context)
-            try:
-                response = await self.client.chat.completions.create(
-                    model=self.config.get_deep_model(),
-                    messages=messages,
-                    temperature=self.config.temperature,
-                    max_tokens=self.config.max_tokens,
-                    timeout=self.config.timeout,
-                )
-                content = response.choices[0].message.content or ""
-                if content:
-                    yield AgentEvent(type="chunk", content=content)
-                    final_output = content
-            except Exception as e:
-                yield AgentEvent(type="error", content=f"LLM Error: {e}")
-
-        # ── Phase 2b: Quality Gate ────────────────────────────────────────
-        if plan.steps:
-            from app.agent.quality_gate import quality_gate_check
-            step_results = self.memory.get_all_results()
-            qg_result = quality_gate_check(step_results)
-            if not qg_result["passed"]:
-                fatal = qg_result.get("fatal_issues", [])
-                warnings = qg_result["summary"]
-                if fatal:
-                    yield AgentEvent(
-                        type="thinking",
-                        content=f"质量门控发现 {len(fatal)} 个问题:\n" + "\n".join(fatal),
-                        thinking_type="evaluation",
-                    )
-                if self.config.enable_thinking:
-                    yield AgentEvent(
-                        type="thinking",
-                        content=warnings[:500],
-                        thinking_type="evaluation",
-                    )
-                logger.info("Quality gate: %d passed, %d concerns, %d failed",
-                    sum(1 for g, _ in qg_result["grades"].values() if g == "A"),
-                    sum(1 for g, _ in qg_result["grades"].values() if g == "C"),
-                    sum(1 for g, _ in qg_result["grades"].values() if g == "F"),
-                )
-
-            # ── Phase 2c: Experience write-back（经验回路的写入侧）───────────
-            # 此前这个回路是**断的**：planner 读经验（format_for_planner），但 runtime
-            # 从不写 ExperienceStore —— 只有离线的 benchmark 批量抽取（run_extract.py）
-            # 会写。结果是「读一个永远不会增长的经验库」。
-            #
-            # 写入失败绝不能影响用户请求：整段包在 try 里，只记 warning。
-            try:
-                await self._write_experiences(ctx, plan, qg_result)
-            except Exception as e:
-                logger.warning("Experience write-back failed: %s", e)
-
-        # ── Phase 3: Reflection ──────────────────────────────────────────
-        if self.config.enable_reflection and plan.steps:
-            results = self.memory.get_all_results()
-            async for event in self.reflector.reflect(plan, results, ctx=ctx):
-                yield event
-                # Check reflection decision
-                if event.type == "reflection" and event.reflection_result == "retry":
-                    step_id = event.plan_step_id
-                    if step_id:
-                        async for evt in self._retry_step(step_id, plan, history):
-                            if evt.type == "chunk":
-                                final_output += "\n\n[重试结果]\n" + evt.content
-                            yield evt
-
-            # ── Phase 3b: Adversarial Review ────────────────────────────────
-            if self.config.enable_reflection and plan.steps:
-                results = self.memory.get_all_results()
-                yield AgentEvent(
-                    type="thinking",
-                    content="进行对抗性质检，审查结果中可能存在的问题...",
-                    thinking_type="evaluation",
-                )
-                await _yield_control()
-                review = await self.reviewer.review(plan, results)
-                issues = review.get("issues_found", [])
-                if issues:
-                    high_issues = [i for i in issues if i.get("severity") == "high"]
-                    if high_issues:
-                        logger.info("Adversarial review found %d high-severity issues", len(high_issues))
-                        for issue in high_issues:
-                            final_output += (
-                                f"\n\n⚠️ **审查发现**: {issue.get('description', '')}\n"
-                                f"  建议: {issue.get('suggestion', '')}"
-                            )
-                            yield AgentEvent(
-                                type="thinking",
-                                content=f"审查发现高风险问题: {issue.get('description', '')}",
-                                thinking_type="evaluation",
-                            )
-                    # Log all issues
-                    for issue in issues:
-                        logger.info(
-                            "Review issue [%s]: %s",
-                            issue.get("severity", "unknown"),
-                            issue.get("description", "")[:100],
-                        )
-
-        # ── Phase 4: Store + Finalize ─────────────────────────────────────
-        await self.memory.record_interaction(query, final_output)
-
-        ctx.mark_done()
-        ctx.record_decision("finalize", "complete", "Agent loop finished")
-        # Persist for execution replay
-        try:
-            await ctx.save()
-        except Exception:
-            pass
-
-        # ── Run report (observe-only, no behavior change) ───────────────
-        # Pure projection of what the run already recorded into ctx.
-        # Does NOT trigger retry/replan/approval/memory/experience. See ADR-1.
-        run_report = build_run_report(ctx, final_output)
-        try:
-            logger.info("\n%s", render_run_report_text(run_report))
-        except Exception:
-            pass
-        yield AgentEvent(
-            type="run_report",
-            content=render_run_report_text(run_report),
-        )
-
-        # Yield execution context as a data event for observability
-        yield AgentEvent(
-            type="execution_context",
-            content=ctx.to_dict(),
-            plan_id=plan.id if plan else "",
-            plan_progress=1.0,
-        )
-
-        elapsed = (time.perf_counter() - start_time) * 1000
-        logger.info(
-            f"PER loop completed in {elapsed:.0f}ms | "
-            f"Plan: {plan.goal[:50]}... | Steps: {plan.completed_steps}/{plan.total_steps} | "
-            f"Output: {len(final_output)} chars"
-        )
-
-        yield AgentEvent(type="done", plan_progress=1.0)
+        plan_sink.append(plan)
 
     async def _retry_step(
         self,
