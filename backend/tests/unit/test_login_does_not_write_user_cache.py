@@ -18,7 +18,9 @@
   4. 任何持有 `_RedisProxy` 单例的代码 —— holder 打桩兜底。
 
 （路径 2/4 的加固来自独立评审 ws103 的 minor-2：此前只打桩前两个入口时，
-模块级 import 会在首个参数运行期间捕获当时那个 mock，让第二个参数静默漏检。）
+模块级 import 会在首个参数运行期间捕获当时那个 mock，让第二个参数静默漏检。
+断言对替身上 `setex` 与 `set` 两种字符串写取并集后过滤 `user:` 前缀——评审
+delta 轮发现只扫 `setex` 时 `.set()` 形状可静默漏过，同批已补上。）
 """
 
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -66,6 +68,7 @@ def _redis_stand_in() -> MagicMock:
     """
     client = MagicMock()
     client.setex = AsyncMock()
+    client.set = AsyncMock()
     client.get = AsyncMock(return_value=None)
     client.delete = AsyncMock()
     client.incr = AsyncMock(return_value=1)
@@ -74,7 +77,7 @@ def _redis_stand_in() -> MagicMock:
     return client
 
 
-def _login_once(route: str, redis_mock: MagicMock):
+def _login_once(route: str):
     """走一次真实登录成功流程：只替换 DB session、Redis 客户端与审计落库。"""
     fake_user = _fake_user()
     result = MagicMock()
@@ -104,6 +107,16 @@ def _login_once(route: str, redis_mock: MagicMock):
         app.dependency_overrides.pop(get_db, None)
 
 
+def _user_cache_writes(redis_mock: MagicMock) -> list[str]:
+    """替身上所有字符串写（`setex` / `set`）里以 `user:` 开头的键。"""
+    string_writes = redis_mock.setex.await_args_list + redis_mock.set.await_args_list
+    return [
+        str(call.args[0])
+        for call in string_writes
+        if call.args and str(call.args[0]).startswith("user:")
+    ]
+
+
 @pytest.mark.parametrize("route", [_FORM_LOGIN, _JSON_LOGIN])
 def test_login_success_does_not_write_user_cache(route: str):
     redis_mock = _redis_stand_in()
@@ -114,15 +127,11 @@ def test_login_success_does_not_write_user_cache(route: str):
         patch.object(redis_module._holder, "_client", redis_mock),
         patch("app.api.v1.endpoints.auth.redis_client", redis_mock, create=True),
     ):
-        response = _login_once(route, redis_mock)
+        response = _login_once(route)
 
     assert response.status_code == 200, f"前提不成立：登录没有成功 —— {response.text}"
 
-    user_cache_writes = [
-        call.args[0]
-        for call in redis_mock.setex.await_args_list
-        if call.args and str(call.args[0]).startswith("user:")
-    ]
+    user_cache_writes = _user_cache_writes(redis_mock)
     assert user_cache_writes == [], (
         f"{route} 又写回了无人读取的 `user:{{id}}` 快照：{user_cache_writes}。"
         "该快照没有任何读方（身份判定只认 DB），只会制造下一份陈旧快照。"
