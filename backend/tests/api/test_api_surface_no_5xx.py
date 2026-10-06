@@ -30,6 +30,13 @@ MinIO → ConnectionError → 404），只是不再空等重试。这也让扫�
 「资源真实存在」时出现，用不存在 id 只能拿到 404、抓不到它；其余参数用
 「看起来合法但大概率不存在」的值（见 `_PATH_PARAM_VALUES`）。
 
+**必填 query 参数**：也从 OpenAPI 动态取（`required: true` 且 `in: query`），
+按 schema 类型注入合法值 —— 不注入的话，`/api/v1/knowledge/suggestions` 与
+`/api/v1/memory/{agent_id}/context` 会恒 422、**处理器根本没被执行**，
+「无 5xx」断言对它们形同虚设（对抗评审 B1：把 suggestions 处理器改坏，扫描仍绿）。
+值的选择：命中 `_PATH_PARAM_VALUES` 的名字（如 `organization_id`）用同名值，
+整型兜底 "1"，字符串兜底 "issue169probe"。
+
 **跳过清单**：只有两条，理由见 `_SKIP_PATHS`；清单本身有防呆断言
 （跳过的路径必须仍存在于 OpenAPI、总数 ≤ 5 —— 防止有人用跳过把问题绕过去）。
 """
@@ -58,8 +65,8 @@ _SKIP_PATHS: dict[str, str] = {
         "注册表规模增长，对 API 客户端的契约意义为零"
     ),
     "/api/v1/auth/ensure-demo": (
-        "GET 带写副作用：启用时创建/重置演示账号（默认关闭，返回 404）。"
-        "扫描必须无写副作用，故跳过"
+        "GET 带写副作用：启用时创建/重置**全局可见**的演示账号（默认关闭，返回 404）。"
+        "扫描的写副作用应限于可清理的探测用户自身，故跳过"
     ),
 }
 _MAX_SKIPS = 5  # 跳过清单的预算上限：超过就说明有人在用跳过绕过问题，必须重新评审
@@ -113,6 +120,26 @@ def _concrete_path(template: str, param_values: dict[str, str]) -> str:
         return param_values.get(match.group(1), "1")
 
     return re.sub(r"\{([^}]+)\}", _sub, template)
+
+
+def _required_query_params(get_op: dict, param_values: dict[str, str]) -> dict[str, str]:
+    """从 OpenAPI 取该 GET 的必填 query 参数并给出合法值。
+
+    不注入的话这类端点会恒 422，处理器根本不被执行 —— 扫描对它们空转
+    （对抗评审 B1 的实测：把处理器改坏仍绿）。
+    """
+    params: dict[str, str] = {}
+    for spec_param in get_op.get("parameters", []):
+        if spec_param.get("in") != "query" or not spec_param.get("required"):
+            continue
+        name = spec_param["name"]
+        if name in param_values:
+            params[name] = param_values[name]
+        elif (spec_param.get("schema") or {}).get("type") in ("integer", "number"):
+            params[name] = "1"
+        else:
+            params[name] = "issue169probe"
+    return params
 
 
 @pytest.fixture(autouse=True)
@@ -273,6 +300,11 @@ async def test_all_get_endpoints_do_not_return_5xx(seeded_identity):
             f"只扫到 {len(scanned)} 个 GET 端点（预期 ≥ {_MIN_SCANNED_ENDPOINTS}），"
             "路由收集出了问题？"
         )
+        # 防呆 3：鉴权防呆清单自身不得随路径改名而静默失效（评审 m1）。
+        for guarded in _AUTH_DEPENDENT_PATHS:
+            assert guarded in scanned, (
+                f"鉴权防呆清单里的 {guarded} 不在扫描集合：路径被改名/移出？请同步清单"
+            )
 
         transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
         async with httpx.AsyncClient(
@@ -280,8 +312,9 @@ async def test_all_get_endpoints_do_not_return_5xx(seeded_identity):
         ) as client:
             for raw in scanned:
                 concrete = _concrete_path(raw, param_values)
+                query_params = _required_query_params(spec["paths"][raw]["get"], param_values)
                 try:
-                    response = await client.get(concrete)
+                    response = await client.get(concrete, params=query_params)
                     results.append((raw, concrete, response.status_code, response.text[:400]))
                 except Exception as exc:  # 连接层失败（超时/传输异常）同样算 5xx 级别的失败
                     results.append((raw, concrete, f"{type(exc).__name__}: {exc}", ""))
