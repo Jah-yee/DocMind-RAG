@@ -30,3 +30,7 @@
 *.ico binary
 *.svg binary
 *.pkl binary
+
+# tiktoken BPE 缓存：内容 sha256 由 tiktoken 运行时自校验（issue #164），
+# 必须字节精确，禁止 LF/CRLF 转换
+backend/docker/tiktoken_cache/* -text
