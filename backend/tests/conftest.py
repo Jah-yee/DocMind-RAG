@@ -17,6 +17,14 @@ import pytest
 from fastapi.testclient import TestClient
 
 # 在导入 app 之前设置测试环境变量，避免 Settings validator 报错
+# tiktoken 的 BPE 缓存（issue #164 起随仓库携带，见 backend/docker/tiktoken_cache/）。
+# 不指过去的话，tiktoken 首次 get_encoding() 会去公网下载：受限网络下拿不到 →
+# 静默降级成启发式计数 → 依赖「精确计数」的用例（如 test_agent_loop_wiring 的
+# 超预算压缩）会随环境时红时绿。指到仓库内的缓存后，测试对网络封闭、结果稳定。
+_TIKTOKEN_CACHE = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "docker", "tiktoken_cache")
+)
+
 _TEST_ENV = {
     "SECRET_KEY": "test-secret-key-for-pytest-only-32chars!",
     "JWT_SECRET_KEY": "test-jwt-secret-key-for-pytest-only!",
@@ -33,6 +41,8 @@ _TEST_ENV = {
     "PROMETHEUS_ENABLED": "true",
     "SANDBOX_MODE": "ast",  # force AST sandbox in tests (no Docker dependency)
 }
+if os.path.isdir(_TIKTOKEN_CACHE):
+    _TEST_ENV["TIKTOKEN_CACHE_DIR"] = _TIKTOKEN_CACHE
 
 # 应用测试环境变量
 for k, v in _TEST_ENV.items():
