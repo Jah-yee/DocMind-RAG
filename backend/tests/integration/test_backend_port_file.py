@@ -13,6 +13,18 @@ issue #170 的根因：lifespan 写入的是 ``settings.PORT``（配置端口）
 2. README 教的 ``--reload`` 形态同样成立 —— lifespan 跑在 spawn 出的子进程里，
    而 stdlib ``multiprocessing.spawn`` 会把父进程的 ``sys.argv`` 传给子进程。
 
+就绪判据是「**文件内容正确 + 该端口可 TCP 连接**」双判据（issue #176）：
+文件内容 == 实际监听端口，拆开看就是「写侧」与「生效侧」两条同时成立 ——
+lifespan 在启动早期就把「自己要绑的端口」写进文件（写侧），uvicorn 完成
+startup 后真的在该端口上监听（生效侧）。只等文件不够（写了不等于在听），
+只等端口也不够（在听不等于文件写对），两者都等到才完整覆盖契约。
+
+旧版拿 ``/health`` 返回 200 当就绪，把纯本地契约耦合到了完整基础设施：
+CI 的 integration job 只提供 MySQL+Redis（Kafka/ES/MinIO 无服务），而
+``/health`` 对每个依赖做最长 3s 的探测（``asyncio.wait_for``），对无服务
+依赖的响应耗时超过测试客户端的 2s 超时 —— 200 永远观察不到（issue #176）。
+端口是否能连与这些外部服务毫无关系，本文件不再依赖它们。
+
 变异验证（交付时人工执行并留原始输出）：把 ``resolve_backend_port()`` 改回
 ``int(os.environ.get("DOCMIND_PORT", settings.PORT))`` —— 上述两条必须变红。
 
@@ -28,7 +40,6 @@ import subprocess
 import sys
 import tempfile
 import time
-import urllib.request
 from pathlib import Path
 
 import psutil
@@ -42,7 +53,7 @@ pytestmark = pytest.mark.skipif(
 BACKEND_DIR = Path(__file__).resolve().parents[2]
 PORT_FILE = BACKEND_DIR / ".backend-port"
 
-_HEALTH_TIMEOUT = 90.0
+_PORT_TIMEOUT = 90.0
 _FILE_TIMEOUT = 30.0
 
 
@@ -147,22 +158,27 @@ def _wait_file_written(proc: subprocess.Popen, log_path: Path) -> str:
     )
 
 
-def _wait_health(port: int, proc: subprocess.Popen, log_path: Path) -> None:
-    url = f"http://127.0.0.1:{port}/health"
-    deadline = time.monotonic() + _HEALTH_TIMEOUT
-    last_err: Exception | None = None
+def _wait_port_listening(cli_port: int, proc: subprocess.Popen, log_path: Path) -> None:
+    """等 uvicorn 真的在该端口上监听（TCP 三次握手成功）—— 契约的生效侧。
+
+    刻意不发任何 HTTP 请求：契约只关心「文件记录的端口 == 进程实际绑定的端口」，
+    与后端依赖的外部服务（MySQL/Redis/ES/Kafka/MinIO）健康与否无关（issue #176）。
+    """
+    deadline = time.monotonic() + _PORT_TIMEOUT
+    last_err: OSError | None = None
     while time.monotonic() < deadline:
         if proc.poll() is not None:
             break
-        try:
-            with urllib.request.urlopen(url, timeout=2) as resp:
-                if resp.status == 200:
-                    return
-        except Exception as e:  # noqa: BLE001 - 未就绪的任何异常都继续等
-            last_err = e
-        time.sleep(0.3)
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(1.0)
+            try:
+                s.connect(("127.0.0.1", cli_port))
+                return
+            except OSError as e:
+                last_err = e
+        time.sleep(0.2)
     raise AssertionError(
-        f"GET {url} 未在 {_HEALTH_TIMEOUT}s 内返回 200（最后错误: {last_err!r}）\n"
+        f"127.0.0.1:{cli_port} 未在 {_PORT_TIMEOUT}s 内接受 TCP 连接（最后错误: {last_err!r}）\n"
         f"进程状态: {'alive' if proc.poll() is None else f'exited rc={proc.returncode}'}\n"
         f"---- uvicorn 输出 ----\n{_tail(log_path)}"
     )
@@ -171,8 +187,10 @@ def _wait_health(port: int, proc: subprocess.Popen, log_path: Path) -> None:
 def _assert_port_file_matches(cli_port: int, configured_port: int, proc, log_path: Path) -> None:
     assert cli_port != configured_port, "用例前提：命令行端口必须与配置端口不同"
 
+    # 写侧：lifespan 启动早期写出 .backend-port（早于所有外部服务连接）。
     content = _wait_file_written(proc, log_path)
-    _wait_health(cli_port, proc, log_path)
+    # 生效侧：uvicorn 完成 startup 后在 --port 上真正监听。
+    _wait_port_listening(cli_port, proc, log_path)
 
     assert content == str(cli_port), (
         f".backend-port 应记录实际监听端口 {cli_port}，实际写入 {content!r}"
