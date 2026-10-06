@@ -200,8 +200,15 @@ jobs:
           python -c "import asyncio; from app.core.database import init_db; asyncio.run(init_db())"
           python scripts/check_schema.py --create-all --report-columns
 
-  # Integration 只在 develop 的推送（即合并）上跑，且必须等快速门禁通过。
+  # Integration 在「push 到 develop」与「PR 指向 develop」时都跑（issue #176），
+  # 且必须等快速门禁通过。
   # 语义：integration 永远验证「一个已通过 PR 门禁的 develop 提交」。
+  #
+  # 此前只在 develop push 触发，导致新增/修改 tests/integration/ 的 PR 在合并前
+  # 永远不执行这些用例 —— #170 的端口文件用例就是这样带着必然失败合入 develop 的
+  # （PR #173 里本 job 是 skipped，CI 全绿，直到 develop 推送才爆）。PR 上本 job
+  # 复用同样的 MySQL/Redis 服务容器，无需额外基础设施；代价是每个指向 develop 的
+  # PR 多一个约 4 分钟的 job（关键路径从 ~78s 到 ~4min，见 issue #176 的取舍记录）。
   #
   # 为什么不用 workflow_run 监听 CI Fast：该触发要求 workflow 文件存在于默认分支
   # （本仓库的 main 只在发版时更新），会让 integration 的定义无法跟随 develop 演进。
@@ -209,7 +216,9 @@ jobs:
   integration:
     name: Integration Tests (MySQL + Redis)
     needs: [backend-tests, migration-mysql]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
+    if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/develop') ||
+      (github.event_name == 'pull_request' && github.base_ref == 'develop')
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
