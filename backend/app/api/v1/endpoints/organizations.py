@@ -175,7 +175,11 @@ async def get_organization(
     org = result.scalar_one_or_none()
     if not org:
         raise NotFoundError("组织不存在")
-    return {"success": True, "data": org}
+    # issue #169：这里曾直接外传 SQLAlchemy ORM 实例，FastAPI 序列化时抛
+    # PydanticSerializationError → 必然 500。改为与 tree / list 端点同源的
+    # 手工字典（_org_to_dict），只暴露前端 Organization 接口需要的字段，
+    # 不顺带把 ORM 全字段（owner_id / updated_at 等）倒给调用方。
+    return {"success": True, "data": organization_service._org_to_dict(org)}
 
 @router.put("/{org_id}", response_model=dict, summary="更新组织信息", dependencies=[Depends(permission_required([PermissionType.UPDATE_ORGANIZATION], organization_id_param='org_id'))])
 async def update_organization(
