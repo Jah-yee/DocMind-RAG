@@ -20,11 +20,13 @@ GET 路径从 `app.openapi()` 动态获取（新端点自动纳入），不是�
 
 **外部服务钉在「不可用」**（`_pin_external_services`）：CI 的两个 job 都没有
 ES/MinIO/Kafka（backend-tests 无 services，后端只看 sqlite 文件；backend-integration
-只有 MySQL+Redis），且真实死连接会带来客户端库的退避成本（实测 ES 每端点 ~8s × 4、
-MinIO 单端点 ~20s）。本 fixture 把 ES 初始化与 MinIO 取对象显式钉成「立即失败」，
-端点代码走的就是它们各自的失败分支（ES → RuntimeError → 降级返回；
-MinIO → ConnectionError → 404），只是不再空等重试。这也让扫描结果与开发机上
-有没有起这些服务**无关**（确定性）。
+只有 MySQL+Redis），第三方 LLM/Embedding 端点更不该成为测试的依赖（测试 key 对
+真实端点毫无意义，真实调用还受网络环境影响：本机实测 `/knowledge/suggestions`
+因此空等 12s）。本 fixture 把 ES 初始化、MinIO 取对象、RAG pipeline 的
+LLM/Embedding/rerank 客户端显式钉成「立即失败」，端点代码走的就是它们各自的
+失败分支（ES → RuntimeError → 降级返回；MinIO → ConnectionError → 404；
+Embedding/LLM → ConnectionError → retriever/reranker 内已有的 except 兜底为 []），
+只是不再空等重试。这也让扫描结果与开发机上有没有起这些服务、有没有外网**无关**（确定性）。
 
 **路径参数替换**：org/user 用本测试亲手种子的真实行 id —— ① 的 500 只在
 「资源真实存在」时出现，用不存在 id 只能拿到 404、抓不到它；其余参数用
@@ -144,13 +146,17 @@ def _required_query_params(get_op: dict, param_values: dict[str, str]) -> dict[s
 
 @pytest.fixture(autouse=True)
 def _pin_external_services(monkeypatch):
-    """把 ES/MinIO 钉在「不可用」：立即失败，不等客户端库的重试退避。
+    """把 ES/MinIO/LLM 与 Embedding 客户端钉在「不可用」：立即失败，不等客户端库的重试退避。
 
-    与 CI 契约一致（两个 job 都没有 ES/MinIO），并让本测试结果与开发机
-    本地服务的有无无关。端点走的仍是各自的失败分支，不是被绕过。
+    与 CI 契约一致（两个 job 都没有 ES/MinIO；第三方 LLM/Embedding 端点更
+    不该是测试的依赖），并让本测试结果与开发机本地服务/网络的有无无关。
+    端点走的仍是各自的失败分支（ES→RuntimeError→降级；MinIO→ConnectionError→404；
+    Embedding/LLM→ConnectionError→retriever/reranker 里本来就有 except 兜底为 []），
+    不是被绕过。
     """
     from app.core import elasticsearch as es_module
     from app.core.minio_client import minio_client
+    from app.dependencies import get_rag_pipeline
 
     async def _noop_initialize():
         return None  # 不再真的去连 ES；get_elasticsearch() 随后抛 RuntimeError（端点已处理）
@@ -175,6 +181,35 @@ def _pin_external_services(monkeypatch):
             raise ConnectionError("MinIO unreachable — pinned by API surface scan")
 
     monkeypatch.setattr(minio_client, "_client", _UnreachableMinio())
+
+    class _UnreachableChatCompletions:
+        async def create(self, *args, **kwargs):
+            raise ConnectionError("LLM API unreachable — pinned by API surface scan")
+
+    class _UnreachableEmbeddings:
+        async def create(self, *args, **kwargs):
+            raise ConnectionError("Embedding API unreachable — pinned by API surface scan")
+
+    class _UnreachableChat:
+        def __init__(self):
+            self.completions = _UnreachableChatCompletions()
+
+    class _UnreachableOpenAI:
+        """等价于第三方 LLM/Embedding 端点不可达（测试 key 对真实端点毫无意义，
+        真实调用还受网络环境影响：本机实测 /knowledge/suggestions 因此空等 12s）。"""
+
+        def __init__(self):
+            self.chat = _UnreachableChat()
+            self.embeddings = _UnreachableEmbeddings()
+
+    # 单例 pipeline 对客户端的引用有两处：pipeline 自身（含 rerank 调用点；它不存
+    # embedding_client，那个只在 retriever 上）与 retriever。
+    pipeline = get_rag_pipeline()
+    unreachable_llm = _UnreachableOpenAI()
+    monkeypatch.setattr(pipeline, "openai_client", unreachable_llm)
+    monkeypatch.setattr(pipeline, "rerank_client", unreachable_llm)
+    monkeypatch.setattr(pipeline.retriever, "openai_client", unreachable_llm)
+    monkeypatch.setattr(pipeline.retriever, "embedding_client", unreachable_llm)
 
 
 @pytest_asyncio.fixture(autouse=True)
