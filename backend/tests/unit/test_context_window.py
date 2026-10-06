@@ -99,3 +99,65 @@ class TestBuildRagMessages:
         assert len(messages) == 4
         assert messages[1]["content"] == "q1"
         assert messages[2]["content"] == "a1"
+
+
+class TestTiktokenUnavailableDegradation:
+    """issue #164：tiktoken 初始化失败（离线/TLS/缓存损坏/未安装）必须降级而非穿透。
+
+    修复前 `except ImportError` 捕不住 SSLError 等运行时失败，RAG 聊天在请求中途
+    以 `event: error` 失败；修复后与 app/agent/context.py 对齐，捕获 Exception 降级。
+    """
+
+    def test_network_failure_degrades_instead_of_raising(self, monkeypatch):
+        import importlib
+
+        import requests
+        import tiktoken
+
+        from app.rag import context_window as cw
+
+        def _ssl_boom(*args, **kwargs):
+            # 与 issue #164 线上一致的失败形态：requests 抛 SSLError（非 ImportError）
+            raise requests.exceptions.SSLError(
+                "HTTPSConnectionPool(host='openaipublic.blob.core.windows.net', port=443): "
+                "Max retries exceeded with url: /encodings/cl100k_base.tiktoken"
+            )
+
+        monkeypatch.setattr(tiktoken, "get_encoding", _ssl_boom)
+        try:
+            importlib.reload(cw)
+            assert cw._ENCODER is None  # 异常被兜底吞掉并降级
+            messages = cw.build_rag_messages(
+                system_prompt="sys",
+                context_docs="ctx",
+                history=[{"role": "user", "content": "hi"}],
+                user_query="问题",
+            )
+            assert messages[0]["role"] == "system"
+            assert messages[-1]["role"] == "user"
+            assert "问题" in messages[-1]["content"]
+            assert cw.estimate_tokens("") == 1  # 启发式计数仍可用
+        finally:
+            monkeypatch.undo()
+            importlib.reload(cw)  # 恢复真实模块状态，避免污染其它用例
+
+    def test_missing_module_degrades_instead_of_raising(self, monkeypatch):
+        import importlib
+        import sys
+
+        from app.rag import context_window as cw
+
+        monkeypatch.setitem(sys.modules, "tiktoken", None)  # import tiktoken -> ImportError
+        try:
+            importlib.reload(cw)
+            assert cw._ENCODER is None
+            messages = cw.build_rag_messages(
+                system_prompt="sys",
+                context_docs="ctx",
+                history=[],
+                user_query="q",
+            )
+            assert messages[-1]["role"] == "user"
+        finally:
+            monkeypatch.undo()
+            importlib.reload(cw)

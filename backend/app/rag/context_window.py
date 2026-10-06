@@ -9,12 +9,21 @@ import logging
 logger = logging.getLogger(__name__)
 
 # tiktoken-based token counting (cl100k_base is a good approximation for most LLMs)
+#
+# 失败面远不止 ImportError：get_encoding() 会在首次使用时读取 BPE 文件，
+# 离线/受限网络下会以 requests.exceptions.SSLError、ConnectionError 等形式失败，
+# 缓存损坏则是 OSError/ValueError —— issue #164：窄捕获直接穿透，RAG 主链路报 event: error。
+# 因此与 app/agent/context.py 对齐，捕获 Exception 并降级为启发式计数。
 try:
     import tiktoken
     _ENCODER = tiktoken.get_encoding("cl100k_base")
-except ImportError:
+    logger.info("tiktoken cl100k_base encoder initialized (token counting: exact)")
+except Exception as e:
     _ENCODER = None
-    logger.warning("tiktoken not installed, falling back to heuristic token counting")
+    logger.warning(
+        f"tiktoken encoding unavailable ({type(e).__name__}: {e}), "
+        "falling back to heuristic token counting"
+    )
 
 
 def estimate_tokens(text: str) -> int:

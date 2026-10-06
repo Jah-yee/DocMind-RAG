@@ -28,6 +28,7 @@ from app.core.prometheus import (
 )
 from app.rag.cache import RetrievalCache, SemanticCache
 from app.rag.context_compressor import compress_context_list
+from app.rag.context_window import build_rag_messages
 from app.rag.metrics import RAGMetrics
 from app.rag.query_processor import (
     QueryComplexityClassifier,
@@ -400,7 +401,8 @@ class RAGPipeline:
             )
 
         # Build token-budget-aware message list
-        from app.rag.context_window import build_rag_messages
+        # （issue #164：build_rag_messages 的 import 已提升到模块顶层，
+        #  tiktoken 编码初始化随应用启动完成，失败不再推迟到首次 RAG 请求）
         raw_messages = build_rag_messages(
             system_prompt=system_prompt,
             context_docs=context_str,
