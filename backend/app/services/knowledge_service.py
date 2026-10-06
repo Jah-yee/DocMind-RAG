@@ -10,10 +10,36 @@ from sqlalchemy import and_, delete, func, select
 from app.core.config import settings
 from app.core.database import AsyncSessionLocal
 from app.core.elasticsearch import get_elasticsearch
-from app.models.document import Document, DocumentChunk, DocumentStatus
+from app.exceptions import AppError
+from app.models.document import Document, DocumentChunk, DocumentStatus, DocumentTag
+from app.models.knowledge_job import KnowledgeProcessingJob
 from app.services.file_service import FileUploadService
 
 logger = logging.getLogger(__name__)
+
+# 引用 documents.id 的子表清单 —— **这个清单是从 information_schema 查出来的，不是凭记忆**：
+#
+#   SELECT kcu.TABLE_NAME, kcu.COLUMN_NAME, rc.DELETE_RULE
+#   FROM information_schema.KEY_COLUMN_USAGE kcu
+#   JOIN information_schema.REFERENTIAL_CONSTRAINTS rc
+#     ON rc.CONSTRAINT_SCHEMA = kcu.CONSTRAINT_SCHEMA
+#    AND rc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME
+#   WHERE kcu.REFERENCED_TABLE_SCHEMA = DATABASE()
+#     AND kcu.REFERENCED_TABLE_NAME = 'documents';
+#
+#   → document_chunks / document_tags / knowledge_processing_jobs（三张表的
+#     document_id 外键均为 NO ACTION，没有 ON DELETE CASCADE，必须应用层显式清）。
+#
+# issue #174：原实现只清了 document_chunks 一张（凭记忆列的清单漏了两张），
+# 每次上传必然写入一条 knowledge_processing_jobs 行 → 删除必然被 1451 外键错误挡住 → 500。
+# 回归网：tests/integration/test_delete_document_children.py 会在真实 MySQL 上重查
+# information_schema，断言本清单与库中引用 documents 的表逐表一致 —— 新增子表
+# （模型 + 迁移）而忘了加进本清单时，该测试变红。
+_DOCUMENT_CHILD_MODELS: tuple[type, ...] = (
+    DocumentChunk,
+    DocumentTag,
+    KnowledgeProcessingJob,
+)
 
 
 class KnowledgeService:
@@ -131,7 +157,12 @@ class KnowledgeService:
     async def delete_knowledge_thoroughly(
         self, document_id: str, organization_id: int | None = None
     ) -> bool:
-        """彻底删除文档"""
+        """彻底删除文档（含所有引用 documents.id 的子表行，清单见 _DOCUMENT_CHILD_MODELS）。
+
+        成功返回 True；文档本就不存在也返回 True（幂等删除语义，与旧行为一致）。
+        失败抛 `AppError` 并携带原始原因 —— 不再 `return False` 把失败原因吞掉
+        （issue #174：调用方只能报「删除失败」，真正的原因只留在服务端日志里）。
+        """
         try:
             logger.info(f"🧹 正在彻底清理文档: {document_id}")
             async with AsyncSessionLocal() as session:
@@ -141,6 +172,8 @@ class KnowledgeService:
                 result = await session.execute(select(Document).where(*conditions))
                 doc = result.scalar_one_or_none()
                 if not doc:
+                    # 幂等：目标状态（无此文档）已达成。直接删除不存在的文档是成功而非失败
+                    # —— 直接调用方（批量删除按原始 id 列表）不应把它计成错误。
                     return True
 
                 if doc.file_path:
@@ -149,8 +182,11 @@ class KnowledgeService:
                     except Exception as e:
                         logger.warning(f"从MinIO删除文件失败: {str(e)}")
 
-                client = await get_elasticsearch()
+                # ES 清理是 best-effort：客户端获取失败（如 ES 未连接/不可用）不得挡住删除。
+                # 客户端获取原先在 try 之外，ES 不可用时整个删除在碰 DB 之前就抛 RuntimeError
+                # （issue #174 顺带修复）。
                 try:
+                    client = await get_elasticsearch()
                     await client.delete_by_query(
                         index=self.index_name,
                         query={"term": {"document_id": document_id}}
@@ -158,7 +194,10 @@ class KnowledgeService:
                 except Exception as e:
                     logger.warning(f"从ES删除索引失败: {str(e)}")
 
-                await session.execute(delete(DocumentChunk).where(DocumentChunk.document_id == document_id))
+                # 先清所有引用 documents.id 的子表，再删主表 —— 外键均无 ON DELETE CASCADE，
+                # 漏任何一张都会被 MySQL 1451 挡住（issue #174）。
+                for model in _DOCUMENT_CHILD_MODELS:
+                    await session.execute(delete(model).where(model.document_id == document_id))
                 await session.execute(delete(Document).where(Document.id == document_id))
                 await session.commit()
 
@@ -167,25 +206,39 @@ class KnowledgeService:
                 await RetrievalCache().clear_for_org(doc.organization_id)
                 await SemanticCache().clear_for_org(doc.organization_id)
                 return True
+        except AppError:
+            raise
         except Exception as e:
-            logger.error(f"彻底删除文档失败: {str(e)}")
-            return False
+            # 不再 return False 吞掉原因：把原始错误类型与消息带给调用方，
+            # 让 500 响应体能定位到问题（issue #174）。
+            logger.error(f"彻底删除文档失败: {type(e).__name__}: {e}")
+            raise AppError(f"删除文档失败: {type(e).__name__}: {e}") from e
 
     async def batch_delete_knowledge(self, document_ids: list[str], organization_id: int | None = None) -> dict[str, Any]:
-        """批量删除文档"""
+        """批量删除文档 —— 单个失败不中断整批，原因逐条收集（issue #174）。
+
+        此前 `delete_knowledge_thoroughly` 返回 False 时只把该条计为「失败」，
+        失败原因无处可见；现在服务层抛带原因的 AppError，这里按条捕获并放进
+        `errors`，其余文档继续删。
+        """
         success_count = 0
-        fail_count = 0
+        errors: list[dict[str, str]] = []
         for doc_id in document_ids:
-            if await self.delete_knowledge_thoroughly(doc_id, organization_id):
+            try:
+                await self.delete_knowledge_thoroughly(doc_id, organization_id)
                 success_count += 1
-            else:
-                fail_count += 1
-        return {
+            except AppError as e:
+                errors.append({"document_id": doc_id, "reason": e.message})
+        fail_count = len(errors)
+        result: dict[str, Any] = {
             "success": True,
             "success_count": success_count,
             "fail_count": fail_count,
             "message": f"成功删除 {success_count} 个文档，失败 {fail_count} 个"
         }
+        if errors:
+            result["errors"] = errors
+        return result
 
 
 # 创建服务实例
