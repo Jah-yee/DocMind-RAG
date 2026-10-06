@@ -4,6 +4,7 @@ DocMind AI Agent System - Main Application Entry (PER Architecture)
 import asyncio
 import logging
 import os
+import sys
 import time
 from contextlib import asynccontextmanager
 
@@ -50,13 +51,79 @@ async def metrics_snapshot_task():
 setup_logging()
 logger = logging.getLogger(__name__)
 
+def _parse_cli_port(argv: list[str]) -> int | None:
+    """从命令行参数中提取 ``--port``（支持 ``--port 8000`` 与 ``--port=8000``）。
+
+    重复出现时取最后一次（与 uvicorn 的 click CLI 语义一致）；
+    缺值 / 非法值 / 越界一律视为未指定，返回 None。
+    """
+    port: int | None = None
+    for i, arg in enumerate(argv):
+        value: str | None = None
+        if arg == "--port" and i + 1 < len(argv):
+            value = argv[i + 1]
+        elif arg.startswith("--port="):
+            value = arg.split("=", 1)[1]
+        if value is None:
+            continue
+        try:
+            parsed = int(value)
+        except ValueError:
+            continue
+        if 0 < parsed < 65536:
+            port = parsed
+    return port
+
+
+def _port_from_env(name: str) -> int | None:
+    """读取环境变量中的端口；未设置 / 空串 / 非法值返回 None（不抛异常）。"""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = int(raw)
+    except ValueError:
+        return None
+    return parsed if 0 < parsed < 65536 else None
+
+
+def resolve_backend_port() -> int:
+    """解析本进程实际监听的端口，供 ``.backend-port`` 同步使用（issue #170）。
+
+    优先级（前三级都是「真实端口」来源，最后一级才是配置兜底）：
+
+    1. 命令行 ``--port``：uvicorn 按它绑定。``--reload`` 模式下 lifespan 跑在
+       spawn 出的子进程里，但 stdlib ``multiprocessing.spawn`` 会把父进程的
+       ``sys.argv`` 传给子进程（``spawn.py`` 的 ``sys_argv``），因此子进程里同样
+       能看到 ``--port``；
+    2. ``DOCMIND_PORT``：``run.py`` 启动时设置（且同时传 ``--port``），
+       作为 argv 不可得时的后备通道；
+    3. ``UVICORN_PORT``：uvicorn CLI 的 click ``auto_envvar_prefix="UVICORN"``，
+       未传 ``--port`` 时它才是实际绑定端口；
+    4. ``settings.PORT``：以上都没有时落回配置值。
+
+    不要把 ``settings.PORT`` 提前 —— 「配置端口 ≠ 实际绑定端口」正是 issue #170
+    的根因：README 教的 ``uvicorn ... --port 8000`` 配 ``.env`` 里的 ``PORT=8010``，
+    旧实现把 8010 写进文件，前端代理因此打到无人监听的端口。
+    """
+    port = _parse_cli_port(sys.argv)
+    if port is not None:
+        return port
+    for name in ("DOCMIND_PORT", "UVICORN_PORT"):
+        port = _port_from_env(name)
+        if port is not None:
+            return port
+    return int(settings.PORT)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期管理"""
     logger.info(f"DocMind v{settings.APP_VERSION} starting up...")
 
-    # 自动同步端口到 .backend-port 文件，Vite 代理依赖此文件
-    actual_port = int(os.environ.get("DOCMIND_PORT", settings.PORT))
+    # 自动同步端口到 .backend-port 文件，Vite 代理依赖此文件。
+    # 必须写入本进程实际监听的端口（issue #170），而不是配置里的端口。
+    actual_port = resolve_backend_port()
     backend_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     port_file = os.path.join(backend_dir, ".backend-port")
     with open(port_file, "w") as f:
