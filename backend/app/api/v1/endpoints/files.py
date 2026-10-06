@@ -34,7 +34,7 @@ async def upload_file(
         current_user = await db.merge(current_user)
         tag_list = [tag.strip() for tag in tags.split(",") if tag.strip()] if tags else None
         # S3 安全加固：无组织用户直接 403，不再兜底到 "1"
-        organization_id = str(require_organization(current_user))
+        organization_id = str(await require_organization(current_user, db))
 
         result = await file_service.upload_file(
             file=file, organization_id=organization_id,
@@ -104,7 +104,7 @@ async def upload_file_chunk(
 ):
     try:
         # S3 安全加固：无组织用户直接 403，不再兜底到 "1"
-        organization_id = str(require_organization(current_user))
+        organization_id = str(await require_organization(current_user, db))
         result = await file_service.upload_chunk(
             chunk_data=chunk_data, chunk_index=chunk_index, total_chunks=total_chunks,
             file_name=file_name, file_hash=file_hash, organization_id=organization_id, user_id=current_user.id
@@ -126,7 +126,7 @@ async def get_document_list(
 ):
     try:
         # S3 安全加固：无组织用户直接 403，不再兜底到 "1"
-        organization_id = str(require_organization(current_user))
+        organization_id = str(await require_organization(current_user, db))
         result = await file_service.get_document_list(
             organization_id=organization_id, user_id=user_id, status=status, skip=skip, limit=limit
         )
@@ -145,7 +145,7 @@ async def delete_document(
 ):
     try:
         # S3 安全加固：无组织用户直接 403，不再兜底到 "1"
-        organization_id = str(require_organization(current_user))
+        organization_id = str(await require_organization(current_user, db))
         success = await file_service.delete_document(
             document_id=document_id, organization_id=organization_id, user_id=current_user.id
         )
