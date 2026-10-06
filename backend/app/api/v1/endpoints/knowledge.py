@@ -535,11 +535,11 @@ async def delete_knowledge_document(
     try:
         doc = await get_document_for_user(db, current_user, document_id)
 
-        # 3. 调用 service 彻底删除
-        success = await knowledge_service.delete_knowledge(document_id, doc.organization_id)
-
-        if not success:
-            raise AppError("删除失败")
+        # 3. 调用 service 彻底删除。
+        # service 成功返回 True / 抛带原始原因的 AppError（issue #174）——
+        # 失败原因经由下面的 AppError 放行分支原样到 500 响应体，不再被吞成
+        # 笼统的「删除失败」。文档不存在在 get_document_for_user 处已 404。
+        await knowledge_service.delete_knowledge(document_id, doc.organization_id)
 
         await audit_service.log_activity(
             user_id=current_user.id,
