@@ -15,7 +15,11 @@ config = context.config
 config.set_main_option("sqlalchemy.url", settings.DATABASE_URL)
 
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    # disable_existing_loggers=False：默认的 True 会把配置里没提到的既有 logger
+    # （如宿主进程的 app.core.database、sqlalchemy 根）置 disabled=True，且全进程残留——
+    # 进程内跑一次迁移就会静默宿主后续所有日志（issue #161，直接造成 #160 的 4 条假红）。
+    # alembic 自身的 logger 在 alembic.ini 里显式配置，本参数不影响其行为。
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 target_metadata = Base.metadata
 
