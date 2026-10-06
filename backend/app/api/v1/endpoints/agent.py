@@ -88,6 +88,7 @@ class SessionCreate(BaseModel):
 async def agent_chat(
     body: AgentChatRequest,
     current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
 ):
     """PER agent chat with streaming events via SSE.
 
@@ -95,8 +96,9 @@ async def agent_chat(
             tool_call, tool_result, tool_error, reflection, chunk, done
     """
     # S3 安全加固：无组织用户直接 403（必须在进入 SSE 流之前抛出），
-    # 不再兜底到 1 号组织去读取其他租户的数据
-    effective_org_id = require_organization(current_user)
+    # 不再兜底到 1 号组织去读取其他租户的数据；
+    # 无组织的超管解析到库里真实存在的组织（无组织则 403，issue #168）
+    effective_org_id = await require_organization(current_user, db)
 
     async def event_stream():
         try:

@@ -142,7 +142,7 @@ async def search_knowledge(
     if current_user.is_superuser and request.organization_id:
         effective_org_id = request.organization_id
     else:
-        effective_org_id = require_organization(current_user)
+        effective_org_id = await require_organization(current_user, db)
 
     try:
         # 允许 search_type 或 search_mode
@@ -195,14 +195,15 @@ async def get_search_suggestions(
     q: str = Query(..., min_length=2, description="搜索查询"),
     organization_id: int = Query(..., description="组织ID"),
     limit: int = Query(5, ge=1, le=10, description="建议数量"),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
 ):
     """
     获取搜索建议
     """
     # S3 安全加固：无组织用户直接 403，不再兜底到 1 号组织；
     # 非超管只能访问自己组织的知识库
-    effective_org_id = require_organization(current_user)
+    effective_org_id = await require_organization(current_user, db)
     if not current_user.is_superuser and organization_id != effective_org_id:
         raise AuthorizationError("无权访问该组织的知识库")
 
@@ -228,14 +229,15 @@ async def get_search_suggestions(
 @router.get("/stats/{organization_id}", response_model=dict, dependencies=[Depends(permission_required([PermissionType.VIEW_KNOWLEDGE_BASE], organization_id_param='organization_id'))])
 async def get_knowledge_stats(
     organization_id: int,
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
 ):
     """
     获取知识库统计信息
     """
     # S3 安全加固：无组织用户直接 403，不再兜底到 1 号组织；
     # 非超管只能访问自己组织的知识库
-    effective_org_id = require_organization(current_user)
+    effective_org_id = await require_organization(current_user, db)
     if not current_user.is_superuser and organization_id != effective_org_id:
         raise AuthorizationError("无权访问该组织的知识库")
 
@@ -257,14 +259,15 @@ async def get_knowledge_stats(
 
 @router.get("/graph/stats", response_model=dict, dependencies=[Depends(permission_required([PermissionType.VIEW_KNOWLEDGE_BASE]))])
 async def get_graph_rag_stats(
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
 ):
     """
     获取GraphRAG知识图谱统计信息
     """
     # 安全加固：图谱按组织隔离，普通用户只能看自己组织的统计；
     # S3：无组织用户直接 403，不再兜底到 1 号组织
-    effective_org = require_organization(current_user)
+    effective_org = await require_organization(current_user, db)
 
     try:
         from app.services.graph_rag_service import graph_rag_service
@@ -288,7 +291,8 @@ async def get_graph_rag_stats(
 
 @router.delete("/graph/clear", response_model=dict, dependencies=[Depends(permission_required([PermissionType.DOCUMENT_DELETE]))])
 async def clear_graph_rag(
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
 ):
     """
     清空GraphRAG知识图谱
@@ -296,7 +300,7 @@ async def clear_graph_rag(
     if not current_user.is_superuser and current_user.role != "admin":
         raise AuthorizationError("需要管理员权限")
     # 安全加固：管理员只清空自己组织的图谱；S3：无组织用户直接 403
-    effective_org = require_organization(current_user)
+    effective_org = await require_organization(current_user, db)
     try:
         from app.services.graph_rag_service import graph_rag_service
 
@@ -490,7 +494,8 @@ async def get_document_job_events(
     if not current_user.is_superuser:
         # S3 安全加固：无组织用户直接 403，不再兜底到 1 号组织
         conditions.append(
-            KnowledgeProcessingJob.organization_id == require_organization(current_user)
+            KnowledgeProcessingJob.organization_id
+            == await require_organization(current_user, db)
         )
     result = await db.execute(
         select(KnowledgeProcessingJob)
@@ -565,7 +570,7 @@ async def batch_delete_documents(
     try:
         # S3 安全加固：无组织用户直接 403（AuthorizationError 会被下面的
         # except 元组原样抛出），不再兜底到 1 号组织
-        effective_org_id = require_organization(current_user)
+        effective_org_id = await require_organization(current_user, db)
         if not current_user.is_superuser and request.organization_id != effective_org_id:
             raise AuthorizationError("无权删除该组织的文档")
 
@@ -739,12 +744,13 @@ async def get_knowledge_graph(
     max_nodes: int = Query(default=50, ge=5, le=200),
     organization_id: int = 1,
     current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
 ):
     """获取知识图谱数据，用于前端可视化。"""
     from app.services.graph_rag_service import graph_rag_service
 
     # S3 安全加固：无组织用户直接 403，不再兜底到 1 号组织
-    effective_org = require_organization(current_user)
+    effective_org = await require_organization(current_user, db)
 
     try:
         # 安全加固：非超管强制使用自己的组织，忽略客户端传入的 organization_id

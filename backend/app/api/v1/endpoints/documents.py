@@ -107,7 +107,6 @@ def build_suggested_tags(content: str) -> list[str]:
 @router.post("/upload", response_model=dict, status_code=status.HTTP_201_CREATED, dependencies=[Depends(permission_required([PermissionType.DOCUMENT_UPLOAD], organization_id_param='organization_id'))])
 async def upload_document(
     file: UploadFile = File(...),
-    organization_id: str | None = Form(None),
     title: str | None = Form(None),
     description: str | None = Form(None),
     tags: str | None = Form(None),
@@ -116,6 +115,10 @@ async def upload_document(
 ):
     """
     上传文档并存入 MinIO 和 数据库
+
+    组织归属由调用者上下文（require_organization）决定，不接受请求体里的
+    organization_id：此前声明的同名 Form 参数在函数体里从未被使用，
+    留一个永远被忽略的 API 参数会误导调用方，已删除（issue #168 §顺带清理）。
     """
     try:
         # 1. 核心修复：合并用户 Session 防止 Persistent 错误
@@ -123,8 +126,9 @@ async def upload_document(
 
         # 2. 确定组织 ID
         # S3 安全加固：fail closed —— 无组织用户不得上传文档，
-        # 不再兜底到最低 ID 的组织或自动创建 Default 组织
-        org_id = require_organization(current_user)
+        # 不再兜底到最低 ID 的组织或自动创建 Default 组织；
+        # 无组织的超管解析到库里真实存在的组织（无组织则 403，issue #168）
+        org_id = await require_organization(current_user, db)
 
         # 3. 解析标签为列表
         keywords_list = []

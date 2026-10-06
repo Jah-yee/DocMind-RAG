@@ -132,7 +132,7 @@ async def create_user_admin(
         org_id = body.organization_ids[0] if body.organization_ids else None
         if org_id is not None and not current_user.is_superuser:
             # S3 安全加固：无组织用户不再兜底到 1 号组织，直接 403
-            if org_id != require_organization(current_user):
+            if org_id != await require_organization(current_user, db):
                 raise AuthorizationError("无权在指定组织创建用户")
 
         user = await auth_service.create_user(
@@ -201,7 +201,7 @@ async def update_user_admin(
         if body.organization_ids:
             org_id = body.organization_ids[0]
             # S3 安全加固：无组织用户不再兜底到 1 号组织，直接 403
-            if not current_user.is_superuser and org_id != require_organization(current_user):
+            if not current_user.is_superuser and org_id != await require_organization(current_user, db):
                 raise AuthorizationError("无权将用户移动到该组织")
             user.organization_id = org_id
         if body.remark is not None:
