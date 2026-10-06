@@ -21,9 +21,10 @@ startup 后真的在该端口上监听（生效侧）。只等文件不够（写
 
 旧版拿 ``/health`` 返回 200 当就绪，把纯本地契约耦合到了完整基础设施：
 CI 的 integration job 只提供 MySQL+Redis（Kafka/ES/MinIO 无服务），而
-``/health`` 对每个依赖做最长 3s 的探测（``asyncio.wait_for``），对无服务
-依赖的响应耗时超过测试客户端的 2s 超时 —— 200 永远观察不到（issue #176）。
-端口是否能连与这些外部服务毫无关系，本文件不再依赖它们。
+``/health``（``app/main.py``）对 ES / MinIO / Redis 的探测各带 ``asyncio.wait_for``
+超时（最长 3s），无服务依赖下整体响应耗时超过测试客户端的 2s urlopen 超时 ——
+200 永远观察不到（issue #176）。端口是否能连与这些外部服务毫无关系，本文件
+不再依赖它们。
 
 变异验证（交付时人工执行并留原始输出）：把 ``resolve_backend_port()`` 改回
 ``int(os.environ.get("DOCMIND_PORT", settings.PORT))`` —— 上述两条必须变红。
