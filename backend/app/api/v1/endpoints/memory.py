@@ -214,7 +214,11 @@ async def get_lessons(
 ):
     """获取经验教训"""
     agent_id = _normalize_agent_id(agent_id)
-    memory_system = _get_user_memory_system(current_user, agent_id)
+    # issue #169：此处漏了 await —— memory_system 拿到的是 coroutine，
+    # 下一行 .reflective 直接 AttributeError → 必然 500（且伴随
+    # "coroutine ... was never awaited" RuntimeWarning）。同文件其余 9 处
+    # 调用均带 await，仅此一处漏。
+    memory_system = await _get_user_memory_system(current_user, agent_id)
     if situation:
         lessons = memory_system.reflective.get_lessons_for_situation(situation)
     else:
